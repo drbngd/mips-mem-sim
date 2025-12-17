@@ -13,6 +13,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cassert>
+#include <memory>
+#include <array>
 
 //#define DEBUG
 
@@ -32,8 +34,7 @@ Pipe_State pipe;
 
 void pipe_init()
 {
-    memset(&pipe, 0, sizeof(Pipe_State));
-    pipe.PC = 0x00400000;
+    pipe = Pipe_State();
 }
 
 void pipe_cycle()
@@ -62,23 +63,19 @@ void pipe_cycle()
         pipe.PC = pipe.branch_dest;
 
         if (pipe.branch_flush >= 2) {
-            if (pipe.decode_op) free(pipe.decode_op);
-            pipe.decode_op = NULL;
+            pipe.decode_op.reset();
         }
 
         if (pipe.branch_flush >= 3) {
-            if (pipe.execute_op) free(pipe.execute_op);
-            pipe.execute_op = NULL;
+            pipe.execute_op.reset();
         }
 
         if (pipe.branch_flush >= 4) {
-            if (pipe.mem_op) free(pipe.mem_op);
-            pipe.mem_op = NULL;
+            pipe.mem_op.reset();
         }
 
         if (pipe.branch_flush >= 5) {
-            if (pipe.wb_op) free(pipe.wb_op);
-            pipe.wb_op = NULL;
+            pipe.wb_op.reset();
         }
 
         pipe.branch_recover = 0;
@@ -109,8 +106,7 @@ void pipe_stage_wb()
         return;
 
     /* grab the op out of our input slot */
-    Pipe_Op *op = pipe.wb_op;
-    pipe.wb_op = NULL;
+    Pipe_Op *op = pipe.wb_op.get();
 
     /* if this instruction writes a register, do so now */
     if (op->reg_dst != -1 && op->reg_dst != 0) {
@@ -124,12 +120,12 @@ void pipe_stage_wb()
     if (op->opcode == OP_SPECIAL && op->subop == SUBOP_SYSCALL) {
         if (op->reg_src1_value == 0xA) {
             pipe.PC = op->pc; /* fetch will do pc += 4, then we stop with correct PC */
-            RUN_BIT = 0;
+            RUN_BIT = false;
         }
     }
 
     /* free the op */
-    free(op);
+    pipe.wb_op.reset();
 
     stat_inst_retire++;
 }
@@ -141,7 +137,7 @@ void pipe_stage_mem()
         return;
 
     /* grab the op out of our input slot */
-    Pipe_Op *op = pipe.mem_op;
+    Pipe_Op *op = pipe.mem_op.get();
 
     uint32_t val = 0;
     if (op->is_mem)
@@ -227,8 +223,7 @@ void pipe_stage_mem()
     }
 
     /* clear stage input and transfer to next stage */
-    pipe.mem_op = NULL;
-    pipe.wb_op = op;
+    pipe.wb_op = std::move(pipe.mem_op);
 }
 
 void pipe_stage_execute()
@@ -238,15 +233,15 @@ void pipe_stage_execute()
         pipe.multiplier_stall--;
 
     /* if downstream stall, return (and leave any input we had) */
-    if (pipe.mem_op != NULL)
+    if (pipe.mem_op)
         return;
 
     /* if no op to execute, return */
-    if (pipe.execute_op == NULL)
+    if (!pipe.execute_op)
         return;
 
     /* grab op and read sources */
-    Pipe_Op *op = pipe.execute_op;
+    Pipe_Op *op = pipe.execute_op.get();
 
     /* read register values, and check for bypass; stall if necessary */
     int stall = 0;
@@ -520,23 +515,21 @@ void pipe_stage_execute()
         pipe_recover(3, op->branch_dest);
 
     /* remove from upstream stage and place in downstream stage */
-    pipe.execute_op = NULL;
-    pipe.mem_op = op;
+    pipe.mem_op = std::move(pipe.execute_op);
 }
 
 void pipe_stage_decode()
 {
     /* if downstream stall, return (and leave any input we had) */
-    if (pipe.execute_op != NULL)
+    if (pipe.execute_op)
         return;
 
     /* if no op to decode, return */
-    if (pipe.decode_op == NULL)
+    if (!pipe.decode_op)
         return;
 
     /* grab op and remove from stage input */
-    Pipe_Op *op = pipe.decode_op;
-    pipe.decode_op = NULL;
+    Pipe_Op *op = pipe.decode_op.get();
 
     /* set up info fields (source/dest regs, immediate, jump dest) as necessary */
     uint32_t opcode = (op->instruction >> 26) & 0x3F;
@@ -661,23 +654,21 @@ void pipe_stage_decode()
     /* we will handle reg-read together with bypass in the execute stage */
 
     /* place op in downstream slot */
-    pipe.execute_op = op;
+    pipe.execute_op = std::move(pipe.decode_op);
 }
 
 void pipe_stage_fetch()
 {
     /* if pipeline is stalled (our output slot is not empty), return */
-    if (pipe.decode_op != NULL)
+    if (pipe.decode_op)
         return;
 
     /* Allocate an op and send it down the pipeline. */
-    Pipe_Op *op = static_cast<Pipe_Op*>(malloc(sizeof(Pipe_Op)));
-    memset(op, 0, sizeof(Pipe_Op));
-    op->reg_src1 = op->reg_src2 = op->reg_dst = -1;
+    auto op = std::make_unique<Pipe_Op>();
 
     op->instruction = mem_read_32(pipe.PC);
     op->pc = pipe.PC;
-    pipe.decode_op = op;
+    pipe.decode_op = std::move(op);
 
     /* update PC */
     pipe.PC += 4;

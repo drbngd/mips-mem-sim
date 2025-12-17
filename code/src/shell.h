@@ -16,10 +16,7 @@
 
 #include <cstdint>
 
-#define FALSE 0
-#define TRUE  1
-
-extern int RUN_BIT;	/* run bit */
+extern bool RUN_BIT;	/* run bit */
 
 /* only the cache touches these functions */
 uint32_t mem_read_32(uint32_t address);
