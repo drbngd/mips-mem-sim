@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <vector>
+#include <memory>
 
 #include "shell.h"
 #include "pipe.h"
@@ -41,23 +43,17 @@ uint32_t stat_squash = 0;
 #define MEM_KTEXT_START 0x80000000
 #define MEM_KTEXT_SIZE  0x00100000
 
-typedef struct {
+struct mem_region_t {
     uint32_t start, size;
-    uint8_t *mem;
-} mem_region_t;
-
-/* memory will be dynamically allocated at initialization */
-mem_region_t MEM_REGIONS[] = {
-    { MEM_TEXT_START, MEM_TEXT_SIZE, NULL },
-    { MEM_DATA_START, MEM_DATA_SIZE, NULL },
-    { MEM_STACK_START, MEM_STACK_SIZE, NULL },
-    { MEM_KDATA_START, MEM_KDATA_SIZE, NULL },
-    { MEM_KTEXT_START, MEM_KTEXT_SIZE, NULL }
+    std::vector<uint8_t> mem;
+    
+    mem_region_t(uint32_t s, uint32_t sz) : start(s), size(sz), mem(sz, 0) {}
 };
 
-#define MEM_NREGIONS (sizeof(MEM_REGIONS)/sizeof(mem_region_t))
+/* memory will be dynamically allocated at initialization */
+std::vector<mem_region_t> MEM_REGIONS;
 
-int RUN_BIT = TRUE;
+bool RUN_BIT = true;
 
 /***************************************************************/
 /*                                                             */
@@ -68,17 +64,15 @@ int RUN_BIT = TRUE;
 /***************************************************************/
 uint32_t mem_read_32(uint32_t address)
 {
-    int i;
-    for (i = 0; i < MEM_NREGIONS; i++) {
-        if (address >= MEM_REGIONS[i].start &&
-                address < (MEM_REGIONS[i].start + MEM_REGIONS[i].size)) {
-            uint32_t offset = address - MEM_REGIONS[i].start;
+    for (auto& region : MEM_REGIONS) {
+        if (address >= region.start && address < (region.start + region.size)) {
+            uint32_t offset = address - region.start;
 
             return
-                (MEM_REGIONS[i].mem[offset+3] << 24) |
-                (MEM_REGIONS[i].mem[offset+2] << 16) |
-                (MEM_REGIONS[i].mem[offset+1] <<  8) |
-                (MEM_REGIONS[i].mem[offset+0] <<  0);
+                (region.mem[offset+3] << 24) |
+                (region.mem[offset+2] << 16) |
+                (region.mem[offset+1] <<  8) |
+                (region.mem[offset+0] <<  0);
         }
     }
 
@@ -94,16 +88,14 @@ uint32_t mem_read_32(uint32_t address)
 /***************************************************************/
 void mem_write_32(uint32_t address, uint32_t value)
 {
-    int i;
-    for (i = 0; i < MEM_NREGIONS; i++) {
-        if (address >= MEM_REGIONS[i].start &&
-                address < (MEM_REGIONS[i].start + MEM_REGIONS[i].size)) {
-            uint32_t offset = address - MEM_REGIONS[i].start;
+    for (auto& region : MEM_REGIONS) {
+        if (address >= region.start && address < (region.start + region.size)) {
+            uint32_t offset = address - region.start;
 
-            MEM_REGIONS[i].mem[offset+3] = (value >> 24) & 0xFF;
-            MEM_REGIONS[i].mem[offset+2] = (value >> 16) & 0xFF;
-            MEM_REGIONS[i].mem[offset+1] = (value >>  8) & 0xFF;
-            MEM_REGIONS[i].mem[offset+0] = (value >>  0) & 0xFF;
+            region.mem[offset+3] = (value >> 24) & 0xFF;
+            region.mem[offset+2] = (value >> 16) & 0xFF;
+            region.mem[offset+1] = (value >>  8) & 0xFF;
+            region.mem[offset+0] = (value >>  0) & 0xFF;
             return;
         }
     }
@@ -148,16 +140,14 @@ void cycle() {
 /*                                                             */
 /***************************************************************/
 void run(int num_cycles) {                                      
-  int i;
-
-  if (RUN_BIT == FALSE) {
+  if (!RUN_BIT) {
     printf("Can't simulate, Simulator is halted\n\n");
     return;
   }
 
   printf("Simulating for %d cycles...\n\n", num_cycles);
-  for (i = 0; i < num_cycles; i++) {
-    if (RUN_BIT == FALSE) {
+  for (int i = 0; i < num_cycles; i++) {
+    if (!RUN_BIT) {
 	    printf("Simulator halted\n\n");
 	    break;
     }
@@ -173,7 +163,7 @@ void run(int num_cycles) {
 /*                                                             */
 /***************************************************************/
 void go() {                                                     
-  if (RUN_BIT == FALSE) {
+  if (!RUN_BIT) {
     printf("Can't simulate, Simulator is halted\n\n");
     return;
   }
@@ -317,11 +307,12 @@ void get_command() {
 /*                                                             */
 /***************************************************************/
 void init_memory() {                                           
-    int i;
-    for (i = 0; i < MEM_NREGIONS; i++) {
-        MEM_REGIONS[i].mem = static_cast<uint8_t*>(malloc(MEM_REGIONS[i].size));
-        memset(MEM_REGIONS[i].mem, 0, MEM_REGIONS[i].size);
-    }
+    MEM_REGIONS.clear();
+    MEM_REGIONS.emplace_back(MEM_TEXT_START, MEM_TEXT_SIZE);
+    MEM_REGIONS.emplace_back(MEM_DATA_START, MEM_DATA_SIZE);
+    MEM_REGIONS.emplace_back(MEM_STACK_START, MEM_STACK_SIZE);
+    MEM_REGIONS.emplace_back(MEM_KDATA_START, MEM_KDATA_SIZE);
+    MEM_REGIONS.emplace_back(MEM_KTEXT_START, MEM_KTEXT_SIZE);
 }
 
 /**************************************************************/
@@ -362,16 +353,14 @@ void load_program(char *program_filename) {
 /*                                                          */
 /************************************************************/
 void initialize(char *program_filename, int num_prog_files) { 
-  int i;
-
   init_memory();
   pipe_init();
-  for ( i = 0; i < num_prog_files; i++ ) {
+  for (int i = 0; i < num_prog_files; i++) {
     load_program(program_filename);
     while(*program_filename++ != '\0');
   }
     
-  RUN_BIT = TRUE;
+  RUN_BIT = true;
 }
 
 /***************************************************************/

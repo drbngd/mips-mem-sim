@@ -10,13 +10,15 @@
 #define _PIPE_H_
 
 #include "shell.h"
+#include <array>
+#include <memory>
 
 /* Pipeline ops (instances of this structure) are high-level representations of
  * the instructions that actually flow through the pipeline. This struct does
  * not correspond 1-to-1 with the control signals that would actually pass
  * through the pipeline. Rather, it carries the original instruction, operand
  * information and values as they are collected, and destination information. */
-typedef struct Pipe_Op {
+struct Pipe_Op {
     /* PC of this instruction */
     uint32_t pc;
     /* raw instruction */
@@ -56,7 +58,15 @@ typedef struct Pipe_Op {
     int is_link;          /* jump-and-link or branch-and-link inst? */
     int link_reg;         /* register to place link into? */
 
-} Pipe_Op;
+    /* Constructor - initializes all fields to safe defaults */
+    Pipe_Op() : pc(0), instruction(0), opcode(0), subop(0),
+                imm16(0), se_imm16(0), shamt(0),
+                reg_src1(-1), reg_src2(-1), reg_src1_value(0), reg_src2_value(0),
+                is_mem(0), mem_addr(0), mem_write(0), mem_value(0),
+                reg_dst(-1), reg_dst_value(0), reg_dst_value_ready(0),
+                is_branch(0), branch_dest(0), branch_cond(0), branch_taken(0),
+                is_link(0), link_reg(0) {}
+};
 
 /* The pipe state represents the current state of the pipeline. It holds a
  * pointer to the op that is currently at the input of each stage. As stages
@@ -67,12 +77,12 @@ typedef struct Pipe_Op {
  * be lost).
  */
 
-typedef struct Pipe_State {
+struct Pipe_State {
     /* pipe op currently at the input of the given stage (NULL for none) */
-    Pipe_Op *decode_op, *execute_op, *mem_op, *wb_op;
+    std::unique_ptr<Pipe_Op> decode_op, execute_op, mem_op, wb_op;
 
     /* register file state */
-    uint32_t REGS[32];
+    std::array<uint32_t, 32> REGS;
     uint32_t HI, LO;
 
     /* program counter in fetch stage */
@@ -90,7 +100,13 @@ typedef struct Pipe_State {
 
     /* place other information here as necessary */
 
-} Pipe_State;
+    /* Constructor - initializes all fields */
+    Pipe_State() : HI(0), LO(0), PC(0x00400000), 
+                   branch_recover(0), branch_dest(0), branch_flush(0),
+                   multiplier_stall(0) {
+        REGS.fill(0);
+    }
+};
 
 /* global variable -- pipeline state */
 extern Pipe_State pipe;
