@@ -9,10 +9,10 @@
 #include "pipe.h"
 #include "shell.h"
 #include "mips.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <assert.h>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <cassert>
 
 //#define DEBUG
 
@@ -671,7 +671,7 @@ void pipe_stage_fetch()
         return;
 
     /* Allocate an op and send it down the pipeline. */
-    Pipe_Op *op = malloc(sizeof(Pipe_Op));
+    Pipe_Op *op = static_cast<Pipe_Op*>(malloc(sizeof(Pipe_Op)));
     memset(op, 0, sizeof(Pipe_Op));
     op->reg_src1 = op->reg_src2 = op->reg_dst = -1;
 

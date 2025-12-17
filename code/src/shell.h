@@ -14,7 +14,7 @@
 #ifndef _SIM_SHELL_H_
 #define _SIM_SHELL_H_
 
-#include <stdint.h>
+#include <cstdint>
 
 #define FALSE 0
 #define TRUE  1
