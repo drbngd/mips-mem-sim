@@ -7,6 +7,7 @@
  */
 
 #include "pipe.h"
+#include "cache.h"
 #include "shell.h"
 #include "mips.h"
 #include <cstdio>
@@ -132,6 +133,12 @@ void pipe_stage_wb()
 
 void pipe_stage_mem()
 {
+    /* if d_cache miss is in progress, return */
+    // if (pipe.d_cache_miss_stall > 0) {
+    //     pipe.d_cache_miss_stall--;
+    //     return;
+    // }
+
     /* if there is no instruction in this pipeline stage, we are done */
     if (!pipe.mem_op)
         return;
@@ -140,9 +147,15 @@ void pipe_stage_mem()
     Pipe_Op *op = pipe.mem_op.get();
 
     uint32_t val = 0;
-    if (op->is_mem)
-        val = mem_read_32(op->mem_addr & ~3);
+    if (op->is_mem) {
+        /* read from d_cache */
+        auto read_result = d_cache.read(op->mem_addr & ~3);
+        pipe.d_cache_miss_stall = read_result.latency; /* set the stall */
+        val = read_result.data; /* get the data */
 
+        /* baseline code */
+        // val = mem_read_32(op->mem_addr & ~3);
+    }
     switch (op->opcode) {
         case OP_LW:
         case OP_LH:
@@ -191,17 +204,25 @@ void pipe_stage_mem()
             break;
 
         case OP_SB:
-            switch (op->mem_addr & 3) {
-                case 0: val = (val & 0xFFFFFF00) | ((op->mem_value & 0xFF) << 0); break;
-                case 1: val = (val & 0xFFFF00FF) | ((op->mem_value & 0xFF) << 8); break;
-                case 2: val = (val & 0xFF00FFFF) | ((op->mem_value & 0xFF) << 16); break;
-                case 3: val = (val & 0x00FFFFFF) | ((op->mem_value & 0xFF) << 24); break;
-            }
+            {
+                switch (op->mem_addr & 3) {
+                    case 0: val = (val & 0xFFFFFF00) | ((op->mem_value & 0xFF) << 0); break;
+                    case 1: val = (val & 0xFFFF00FF) | ((op->mem_value & 0xFF) << 8); break;
+                    case 2: val = (val & 0xFF00FFFF) | ((op->mem_value & 0xFF) << 16); break;
+                    case 3: val = (val & 0x00FFFFFF) | ((op->mem_value & 0xFF) << 24); break;
+                }
+    
+                auto write_result = d_cache.write(op->mem_addr & ~3, val);
+                pipe.d_cache_miss_stall += write_result.latency; /* set the stall: read+write miss latency */
+                
+                /* baseline code */
+                // mem_write_32(op->mem_addr & ~3, val);
 
-            mem_write_32(op->mem_addr & ~3, val);
+            }
             break;
 
         case OP_SH:
+        {
 #ifdef DEBUG
             printf("SH: addr %08x val %04x old word %08x\n", op->mem_addr, op->mem_value & 0xFFFF, val);
 #endif
@@ -213,12 +234,24 @@ void pipe_stage_mem()
             printf("new word %08x\n", val);
 #endif
 
-            mem_write_32(op->mem_addr & ~3, val);
+            auto write_result = d_cache.write(op->mem_addr & ~3, val);
+            pipe.d_cache_miss_stall += write_result.latency; /* set the stall: read+write miss latency */
+
+            /* baseline code */
+            // mem_write_32(op->mem_addr & ~3, val);
+        }
+
             break;
 
         case OP_SW:
-            val = op->mem_value;
-            mem_write_32(op->mem_addr & ~3, val);
+            {
+                val = op->mem_value;
+                auto write_result = d_cache.write(op->mem_addr & ~3, val);
+                pipe.d_cache_miss_stall = write_result.latency; /* set the stall only write as we write full word */
+
+                /* baseline code */
+                // mem_write_32(op->mem_addr & ~3, val);
+            }
             break;
     }
 
@@ -657,21 +690,53 @@ void pipe_stage_decode()
     pipe.execute_op = std::move(pipe.decode_op);
 }
 
+
 void pipe_stage_fetch()
 {
-    /* if pipeline is stalled (our output slot is not empty), return */
+    
+    
+
+    /* Handle stall countdown */
+    if (pipe.i_cache_miss_stall > 0) {
+        pipe.i_cache_miss_stall--;
+        
+        /* mark data ready on the last cycle of stall */
+        if (pipe.i_cache_miss_stall == 0) {
+            pipe.i_cache_pending_valid = true;  /* mark data ready */
+        }
+        return;
+    }
+
     if (pipe.decode_op)
         return;
-
-    /* Allocate an op and send it down the pipeline. */
+    
+    uint32_t instruction_data;
+    
+    /* Check if we have pending data from completed miss */
+    if (pipe.i_cache_pending_valid) {
+        /* use cached result, no cache access */
+        instruction_data = pipe.i_cache_pending_data;
+        pipe.i_cache_pending_valid = false;
+    } else {
+        /* fresh cache access */
+        Cache_Result result = i_cache.read(pipe.PC);
+        
+        if (result.latency > 1) {
+            /* miss! stall and save data for later */
+            pipe.i_cache_miss_stall = result.latency - 1;
+            pipe.i_cache_pending_data = result.data;  /* save data */
+            return;
+        }
+        
+        /* hit! use data immediately */
+        instruction_data = result.data;
+    }
+    
+    /* fetch instruction */
     auto op = std::make_unique<Pipe_Op>();
-
-    op->instruction = mem_read_32(pipe.PC);
+    op->instruction = instruction_data;
     op->pc = pipe.PC;
     pipe.decode_op = std::move(op);
-
-    /* update PC */
     pipe.PC += 4;
-
     stat_inst_fetch++;
 }

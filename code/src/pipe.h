@@ -97,13 +97,22 @@ struct Pipe_State {
 
     /* multiplier stall info */
     int multiplier_stall; /* number of remaining cycles until HI/LO are ready */
+    
 
     /* place other information here as necessary */
+
+    /* cache miss stall info */
+    int i_cache_miss_stall; /* number of remaining cycles until i_cache miss is resolved */
+    int d_cache_miss_stall; /* number of remaining cycles until d_cache miss is resolved */
+    bool i_cache_pending_valid; /* is there pending data from a completed miss? */
+    uint32_t i_cache_pending_data; /* data from a completed miss */
+    bool d_cache_pending_valid; /* is there pending data from a completed miss? */
+    uint32_t d_cache_pending_data; /* data from a completed miss */
 
     /* Constructor - initializes all fields */
     Pipe_State() : HI(0), LO(0), PC(0x00400000), 
                    branch_recover(0), branch_dest(0), branch_flush(0),
-                   multiplier_stall(0) {
+                   multiplier_stall(0), i_cache_miss_stall(0), d_cache_miss_stall(0) {
         REGS.fill(0);
     }
 };

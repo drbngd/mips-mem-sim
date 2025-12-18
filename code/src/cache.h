@@ -2,81 +2,77 @@
 #define _CACHE_H_
 
 #include "shell.h"
+#include <array>
+#include <vector>
 #include <cstdint>
 #include <stdint.h>
 
+extern uint32_t stat_cycles;
+
+#define CACHE_LINE_SIZE 32 /* 32 bytes */
 #define L1_CACHE_MISS_PENALTY 50
-#define L1_CACHE_LINE_SIZE 32 /* 32 bytes */
 #define I_CACHE_NUM_SETS 64
 #define I_CACHE_ASSOC 4
 #define D_CACHE_NUM_SETS 256
 #define D_CACHE_ASSOC 8
 
+struct Cache_Result {
+    uint32_t data;
+    uint32_t latency;
+};
 
-typedef struct Cache_Line {
 
-    uint32_t *data; /* pointer to data */
+
+struct Cache_Line {
+
+    std::array<uint8_t, CACHE_LINE_SIZE> data; /* 32 bytes of data */
     uint32_t tag; /* tag */
-    uint32_t valid; /* valid bit */
-    uint32_t dirty; /* dirty bit */
-    uint32 last_touch_tick; /* last touch tick */
+    bool valid; /* valid bit */
+    bool dirty; /* dirty bit */
+    uint32_t last_touch_tick; /* clock cycle when the line was last touched */
+    Cache_Line() : data{}, tag(0), valid(false), dirty(false), last_touch_tick(0) {}
 
-} Cache_Line;
-
-
-typedef struct Cache_Set {
-
-    Cache_Line *lines; /* pointer to lines in the set */
-    uint32_t LRU; /* least recently used line index */
-
-} Cache_Set;
+};
 
 
-typedef struct Cache {
+struct Cache_Set {
 
-    Cache_Set *sets; /* pointer to sets in the cache */
+    std::vector<Cache_Line> lines; /* lines in the set */
+    Cache_Set(uint32_t assoc) : lines(assoc, Cache_Line()) {}
+
+};
+
+
+class Cache {
+
+private:
+    std::vector<Cache_Set> sets; /* pointer to sets in the cache */
     uint32_t num_sets; /* number of sets in the cache */
     uint32_t assoc; /* associativity */
-    uint32_t line_size; /* line size */
     uint32_t miss_penalty; /* miss penalty */
+    uint32_t find_victim(uint32_t set_index) const;
+    uint32_t find_victim_lru(uint32_t set_index) const;
+    void evict(uint32_t tag, uint32_t set_index, uint32_t way);
+    void fetch(uint32_t address, uint32_t tag, uint32_t set_index, uint32_t way);
+    uint32_t lookup(std::vector<Cache_Line>& set, uint32_t tag);
 
-    /* statistics */
-    uint32_t read_misses;
-    uint32_t write_misses;
-    uint32_t read_hits;
-    uint32_t write_hits;
-    
-} Cache;
+public:
+    Cache(uint32_t num_sets, uint32_t assoc, uint32_t miss_penalty) : sets(num_sets, Cache_Set(assoc)), num_sets(num_sets), assoc(assoc), miss_penalty(miss_penalty) {}
+    Cache_Result read(uint32_t address);
+    Cache_Result write(uint32_t address, uint32_t value);
+    void flush();
+
+};
 
 /* global variable -- cache */
 extern Cache i_cache;
 extern Cache d_cache;
 
-/* initialize the cache */
-void cache_init(Cache *cache, int num_sets, int assoc, int line_size, int miss_penalty);
-
-/* read from the cache */
-uint32_t cache_read(Cache *cache, uint32_t address);
-
-/* write to the cache */
-uint32_t cache_write(Cache *cache, uint32_t address, uint32_t value);
+/* helper function */
+void decipher_address(uint32_t address, uint32_t &tag, uint32_t &set_index, uint32_t &offset);
 
 /* helper function */
 int log2_32(int n);
-
-/* helper function */
-uint32_t undo_little_endian(uint32_t data);
-
-/* cache statistics */
-extern uint32_t stat_i_cache_read_misses;
-extern uint32_t stat_d_cache_read_misses;
-extern uint32_t stat_i_cache_write_misses;
-extern uint32_t stat_d_cache_write_misses;
-extern uint32_t stat_i_cache_read_hits;
-extern uint32_t stat_d_cache_read_hits;
-extern uint32_t stat_i_cache_write_hits;
-extern uint32_t stat_d_cache_write_hits;
-
 
 
 

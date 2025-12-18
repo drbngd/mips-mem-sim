@@ -1,0 +1,19 @@
+# to merge current branch to main
+git branch
+git add -A
+git commit -m "something here ..."
+git push origin $(git branch --show-current)
+git checkout main
+git pull origin main
+git merge <your_branch_name>
+git push origin main
+
+# to merge main into curr branch
+git branch
+git add -A
+git commit -m "work in progress before merging main"
+git fetch origin
+git merge origin/main
+git add <resolved files>
+git commit -m "merge main into current branch"
+git push origin $(git branch --show-current)

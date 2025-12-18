@@ -126,10 +126,19 @@ void help() {
 /* Purpose   : Execute a cycle                                 */
 /*                                                             */
 /***************************************************************/
-void cycle() {                                                
+void cycle() {
+  static int infinite_loop_detect = 0;
   pipe_cycle();
 
   stat_cycles++;
+
+  infinite_loop_detect++;
+    if (infinite_loop_detect > 300040) {
+        printf("ERROR: Infinite loop detected! Stopping.\n");
+        printf("PC=0x%08x, stalls: i=%d d=%d\n", 
+               pipe.PC, pipe.i_cache_miss_stall, pipe.d_cache_miss_stall);
+        RUN_BIT = false;
+    }
 }
 
 /***************************************************************/
