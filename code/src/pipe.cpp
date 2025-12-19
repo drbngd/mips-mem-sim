@@ -168,7 +168,7 @@ void pipe_stage_mem()
             /* For SW, we can write directly */
             if (op->opcode == OP_SW) {
                 /* SW: write full word to cache */
-                Cache_Result result = d_cache.write(op->mem_addr & ~3, op->mem_value);
+                Cache_Result result = d_cache->write(op->mem_addr & ~3, op->mem_value);
                 if (result.latency > 0) {
                     pipe.mem_cache_op_done = true;  /* don't write again after stall */
                     pipe.mem_stall = result.latency - 1;
@@ -176,7 +176,7 @@ void pipe_stage_mem()
                 }
             } else {
                 /* All other memory ops need to read first */
-                Cache_Result result = d_cache.read(op->mem_addr & ~3);
+                Cache_Result result = d_cache->read(op->mem_addr & ~3);
                 if (result.latency > 0) {
                     pipe.pending_mem_data = result.data;  /* save for after stall */
                     pipe.mem_cache_op_done = true;
@@ -246,7 +246,7 @@ void pipe_stage_mem()
             /* In single-core: will hit since we just read the line.
                In multi-core: could miss due to coherency invalidation.
                For now, ignore write latency (assumes single-core). */
-            d_cache.write(op->mem_addr & ~3, val);
+            d_cache->write(op->mem_addr & ~3, val);
             break;
 
         case OP_SH:
@@ -264,7 +264,7 @@ void pipe_stage_mem()
             /* In single-core: will hit since we just read the line.
                In multi-core: could miss due to coherency invalidation.
                For now, ignore write latency (assumes single-core). */
-            d_cache.write(op->mem_addr & ~3, val);
+            d_cache->write(op->mem_addr & ~3, val);
             break;
 
         case OP_SW:
@@ -734,7 +734,7 @@ void pipe_stage_fetch()
         return;
 
     /* Access instruction cache */
-    Cache_Result result = i_cache.read(pipe.PC);
+    Cache_Result result = i_cache->read(pipe.PC);
 
     /* If cache miss, store the instruction and start stalling */
     if (result.latency > 0) {
