@@ -15,8 +15,8 @@ uint32_t stat_d_cache_write_hits = 0;
 
 
 /* global variable -- cache */
-Cache i_cache(I_CACHE_NUM_SETS, I_CACHE_ASSOC, L1_CACHE_MISS_PENALTY);
-Cache d_cache(D_CACHE_NUM_SETS, D_CACHE_ASSOC, L1_CACHE_MISS_PENALTY);
+Cache i_cache(I_CACHE_NUM_SETS, I_CACHE_ASSOC, CACHE_LINE_SIZE, L1_CACHE_MISS_PENALTY);
+Cache d_cache(D_CACHE_NUM_SETS, D_CACHE_ASSOC, CACHE_LINE_SIZE, L1_CACHE_MISS_PENALTY);
 
 
 
@@ -27,11 +27,11 @@ int log2_32(int n)
 }
 
 
-void decipher_address(uint32_t address, uint32_t num_sets, uint32_t &tag, uint32_t &set_index, uint32_t &offset) 
+void decipher_address(uint32_t address, uint32_t line_size, uint32_t num_sets, uint32_t &tag, uint32_t &set_index, uint32_t &offset) 
 {
-    offset = address & (CACHE_LINE_SIZE - 1);
-    set_index = (address >> log2_32(CACHE_LINE_SIZE)) & (num_sets - 1);
-    tag = address >> (log2_32(CACHE_LINE_SIZE) + log2_32(num_sets));
+    offset = address & (line_size - 1);
+    set_index = (address >> log2_32(line_size)) & (num_sets - 1);
+    tag = address >> (log2_32(line_size) + log2_32(num_sets));
 }
 
 
@@ -59,9 +59,9 @@ uint32_t Cache::find_victim_lru(uint32_t set_index) const
 void Cache::evict(uint32_t tag, uint32_t set_index, uint32_t way)
 {
     if (sets[set_index].lines[way].dirty) {
-        uint32_t line_addr = (tag << (log2_32(num_sets) + log2_32(CACHE_LINE_SIZE))) | 
-                             (set_index << log2_32(CACHE_LINE_SIZE));
-        for (auto i = 0; i < CACHE_LINE_SIZE; i+=4) {
+        uint32_t line_addr = (tag << (log2_32(num_sets) + log2_32(line_size))) | 
+                             (set_index << log2_32(line_size));
+        for (auto i = 0; i < line_size; i+=4) {
             mem_write_32(line_addr + i, (sets[set_index].lines[way].data[i+3] << 24) |
                                                        (sets[set_index].lines[way].data[i+2] << 16) |
                                                        (sets[set_index].lines[way].data[i+1] <<  8) |
@@ -80,8 +80,8 @@ void Cache::fetch(uint32_t address, uint32_t tag, Cache_Line& line)
 {
     /* we are supposed to fetch the entire cache line starting from line-aligned address */ 
     /* Compute line-aligned base address */
-    uint32_t line_base = address & ~(CACHE_LINE_SIZE - 1);
-    for (auto i = 0; i < CACHE_LINE_SIZE; i+=4) {
+    uint32_t line_base = address & ~(line_size - 1);
+    for (auto i = 0; i < line_size; i+=4) {
         uint32_t word = mem_read_32(line_base + i);
         line.data[i+3] = (word >> 24) & 0xFF;
         line.data[i+2] = (word >> 16) & 0xFF;
@@ -112,13 +112,20 @@ Cache_Result Cache::read(uint32_t address)
 {
     
     uint32_t tag, set_index, offset;
-    decipher_address(address, num_sets, tag, set_index, offset);
+    decipher_address(address, line_size, num_sets, tag, set_index, offset);
     auto& set = sets[set_index].lines;
 
     uint32_t way = lookup(set, tag);
     if (way != UINT32_MAX) {
+        /* Cache hit */
         /* Update LRU on hit */
         set[way].last_touch_tick = stat_cycles;
+        /* Track statistics - determine if I-cache or D-cache */
+        if (this == &i_cache) {
+            stat_i_cache_read_hits++;
+        } else {
+            stat_d_cache_read_hits++;
+        }
         return {static_cast<uint32_t>(
                (set[way].data[offset+3] << 24) |
                (set[way].data[offset+2] << 16) |
@@ -127,6 +134,7 @@ Cache_Result Cache::read(uint32_t address)
                0};
     }
 
+    /* Cache miss */
     uint32_t victim_way = find_victim(set_index);
     
     /* evict the victim way */
@@ -134,6 +142,12 @@ Cache_Result Cache::read(uint32_t address)
     evict(tag, set_index, victim_way);
 
     fetch(address, tag, set[victim_way]);
+    /* Track statistics - determine if I-cache or D-cache */
+    if (this == &i_cache) {
+        stat_i_cache_read_misses++;
+    } else {
+        stat_d_cache_read_misses++;
+    }
     return {static_cast<uint32_t>(
            (set[victim_way].data[offset+3] << 24) |
            (set[victim_way].data[offset+2] << 16) |
@@ -147,11 +161,12 @@ Cache_Result Cache::write(uint32_t address, uint32_t value)
 {
 
     uint32_t tag, set_index, offset;
-    decipher_address(address, num_sets, tag, set_index, offset);
+    decipher_address(address, line_size, num_sets, tag, set_index, offset);
     auto& set = sets[set_index].lines;
 
     uint32_t way = lookup(set, tag);
     if (way != UINT32_MAX) {
+        /* Cache hit */
         /* Update LRU on hit */
         set[way].last_touch_tick = stat_cycles;
         /* write */
@@ -160,9 +175,16 @@ Cache_Result Cache::write(uint32_t address, uint32_t value)
         set[way].data[offset+2] = (value >> 16) & 0xFF;
         set[way].data[offset+1] = (value >>  8) & 0xFF;
         set[way].data[offset+0] = (value >>  0) & 0xFF;
+        /* Track statistics - determine if I-cache or D-cache */
+        if (this == &i_cache) {
+            stat_i_cache_write_hits++;
+        } else {
+            stat_d_cache_write_hits++;
+        }
         return {0, 0};
     }
 
+    /* Cache miss */
     uint32_t victim_way = find_victim(set_index);
     evict(tag, set_index, victim_way);
 
@@ -172,6 +194,12 @@ Cache_Result Cache::write(uint32_t address, uint32_t value)
     set[victim_way].data[offset+2] = (value >> 16) & 0xFF;
     set[victim_way].data[offset+1] = (value >>  8) & 0xFF;
     set[victim_way].data[offset+0] = (value >>  0) & 0xFF;
+    /* Track statistics - determine if I-cache or D-cache */
+    if (this == &i_cache) {
+        stat_i_cache_write_misses++;
+    } else {
+        stat_d_cache_write_misses++;
+    }
     return {0, miss_penalty};
 }
 

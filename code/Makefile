@@ -1,5 +1,5 @@
 SRC = $(wildcard src/*.cpp)
-INPUT ?= $(wildcard inputs/*/*.x)
+INPUT ?= $(wildcard inputs/cache/*.x)
 
 .PHONY: all verify clean
 

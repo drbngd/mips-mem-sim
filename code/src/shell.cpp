@@ -18,6 +18,7 @@
 #include <vector>
 #include "shell.h"
 #include "pipe.h"
+#include "cache.h"
 
 /***************************************************************/
 /* Statistics.                                                 */
@@ -31,7 +32,7 @@ uint32_t stat_squash = 0;
 /***************************************************************/
 
 #define MEM_DATA_START  0x10000000
-#define MEM_DATA_SIZE   0x00100000
+#define MEM_DATA_SIZE   0x01000000
 #define MEM_TEXT_START  0x00400000
 #define MEM_TEXT_SIZE   0x00100000
 #define MEM_STACK_START 0x7ff00000
@@ -195,6 +196,41 @@ void rdump() {
     printf("RetiredInstr: %u\n", stat_inst_retire);
     printf("IPC: %0.3f\n", ((float) stat_inst_retire) / stat_cycles);
     printf("Flushes: %u\n", stat_squash);
+    
+    /* Cache Statistics */
+    uint32_t i_cache_reads = stat_i_cache_read_hits + stat_i_cache_read_misses;
+    uint32_t i_cache_writes = stat_i_cache_write_hits + stat_i_cache_write_misses;
+    uint32_t i_cache_accesses = i_cache_reads + i_cache_writes;
+    uint32_t i_cache_hits = stat_i_cache_read_hits + stat_i_cache_write_hits;
+    uint32_t i_cache_misses = stat_i_cache_read_misses + stat_i_cache_write_misses;
+    
+    uint32_t d_cache_reads = stat_d_cache_read_hits + stat_d_cache_read_misses;
+    uint32_t d_cache_writes = stat_d_cache_write_hits + stat_d_cache_write_misses;
+    uint32_t d_cache_accesses = d_cache_reads + d_cache_writes;
+    uint32_t d_cache_hits = stat_d_cache_read_hits + stat_d_cache_write_hits;
+    uint32_t d_cache_misses = stat_d_cache_read_misses + stat_d_cache_write_misses;
+    
+    printf("\n=== I-Cache Statistics ===\n");
+    printf("I-cache accesses: %u\n", i_cache_accesses);
+    printf("I-cache reads: %u\n", i_cache_reads);
+    printf("I-cache writes: %u\n", i_cache_writes);
+    printf("I-cache hits: %u\n", i_cache_hits);
+    printf("I-cache misses: %u\n", i_cache_misses);
+    if (i_cache_accesses > 0) {
+        printf("I-cache hit rate: %0.4f\n", ((float) i_cache_hits) / i_cache_accesses);
+        printf("I-cache miss rate: %0.4f\n", ((float) i_cache_misses) / i_cache_accesses);
+    }
+    
+    printf("\n=== D-Cache Statistics ===\n");
+    printf("D-cache accesses: %u\n", d_cache_accesses);
+    printf("D-cache reads: %u\n", d_cache_reads);
+    printf("D-cache writes: %u\n", d_cache_writes);
+    printf("D-cache hits: %u\n", d_cache_hits);
+    printf("D-cache misses: %u\n", d_cache_misses);
+    if (d_cache_accesses > 0) {
+        printf("D-cache hit rate: %0.4f\n", ((float) d_cache_hits) / d_cache_accesses);
+        printf("D-cache miss rate: %0.4f\n", ((float) d_cache_misses) / d_cache_accesses);
+    }
 }
 
 /***************************************************************/ 

@@ -1,26 +1,24 @@
-# build outputs
+# Build outputs
 sim
-*.o
-*.a
-*.so
-*.dylib
-*.exe
-*.out
 *.dSYM/
 !code/basesim.dSYM/
 
-# Python helper noise
-__pycache__/
-*.pyc
-*.pyo
+# Virtual environments
+venv/
 
-# editor/OS noise
+# Python cache and bytecode
+__pycache__/
+
+# Results and analysis outputs
+results/
+
+
+# Editor/IDE files
 .DS_Store
 *.swp
 *.swo
+*~
 .idea/
 .vscode/
 
-# local logs/temp
-*.log
-*.tmp
+

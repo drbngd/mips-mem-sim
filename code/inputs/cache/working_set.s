@@ -13,7 +13,9 @@
 repeat_loop:
     # Inner loop: traverse 32K words = 128KB
     # Since D-cache is 64KB, this will cause thrashing
-    addiu $s1, $zero, 32768
+    # 32768 = 0x8000, but addiu sign-extends, so use lui+ori
+    lui $s1, 0
+    ori $s1, $s1, 32768         # 32768 = 0x8000
     move $t1, $s0
     
 traverse_loop:

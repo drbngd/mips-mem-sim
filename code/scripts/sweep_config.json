@@ -1,0 +1,37 @@
+{
+  "cache_configs": {
+    "d_cache_num_sets": [64, 128, 256, 512, 1024],
+    "line_sizes_bytes": [8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+    "associativities": [1, 2, 4, 8, 16],
+    "i_cache_num_sets": [16, 32, 64, 128, 256]
+  },
+  "benchmarks": [
+    "streaming",
+    "strided",
+    "stride_32",
+    "stride_64",
+    "working_set",
+    "working_set_1gb",
+    "cache_stress",
+    "stream_large",
+    "matrix_col",
+    "matrix_transpose",
+    "pointer_chase",
+    "gups",
+    "stencil",
+    "vector_add",
+    "stream_triad",
+    "write_intensive"
+  ],
+  "output": {
+    "format": "csv",
+    "filename": "cache_sweep_results.csv",
+    "results_dir": "results"
+  },
+  "options": {
+    "skip_invalid_configs": true,
+    "verbose": true,
+    "save_intermediate": false
+  }
+}
+
