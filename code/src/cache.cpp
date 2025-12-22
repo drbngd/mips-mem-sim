@@ -21,12 +21,13 @@ uint32_t stat_d_cache_write_hits = 0;
  * Cache Constructor and Destructor
  * ============================================================================ */
 
-Cache::Cache(uint32_t num_sets, uint32_t assoc, uint32_t line_size, uint32_t miss_penalty, ReplacementPolicy policy) 
+Cache::Cache(uint32_t num_sets, uint32_t assoc, uint32_t line_size, uint32_t miss_penalty, ReplacementPolicy policy, CacheLevel level) 
     : sets(num_sets, Cache_Set(assoc, line_size)), 
       num_sets(num_sets), 
       assoc(assoc), 
       miss_penalty(miss_penalty), 
       line_size(line_size),
+      level(level),
       policy(policy),
       psel_counter(nullptr),
       eaf_filter(nullptr),
@@ -60,8 +61,10 @@ Cache::~Cache()
 
 /* global variable -- cache */
 /* Using pointers to allow runtime policy changes without recompilation */
-Cache* i_cache = new Cache(I_CACHE_NUM_SETS, I_CACHE_ASSOC, CACHE_LINE_SIZE, L1_CACHE_MISS_PENALTY, POLICY_LRU);
-Cache* d_cache = new Cache(D_CACHE_NUM_SETS, D_CACHE_ASSOC, CACHE_LINE_SIZE, L1_CACHE_MISS_PENALTY, POLICY_EAF);
+/* L2 cache must be initialized first since L1 caches probe it */
+Cache* l2_cache = new Cache(L2_CACHE_NUM_SETS, L2_CACHE_ASSOC, CACHE_LINE_SIZE, L2_CACHE_HIT_LATENCY, POLICY_LRU, CACHE_L2);
+Cache* i_cache = new Cache(I_CACHE_NUM_SETS, I_CACHE_ASSOC, CACHE_LINE_SIZE, L1_CACHE_MISS_PENALTY, POLICY_LRU, CACHE_L1);
+Cache* d_cache = new Cache(D_CACHE_NUM_SETS, D_CACHE_ASSOC, CACHE_LINE_SIZE, L1_CACHE_MISS_PENALTY, POLICY_EAF, CACHE_L1);
 
 
 
@@ -371,11 +374,25 @@ void Cache::evict(uint32_t tag, uint32_t set_index, uint32_t way)
     if (line.dirty) {
         uint32_t line_addr = (tag << (log2_32(num_sets) + log2_32(line_size))) | 
                              (set_index << log2_32(line_size));
-        for (auto i = 0; i < line_size; i+=4) {
-            mem_write_32(line_addr + i, (line.data[i+3] << 24) |
-                                        (line.data[i+2] << 16) |
-                                        (line.data[i+1] <<  8) |
-                                        (line.data[i+0] <<  0));
+        
+        if (!is_l2()) {
+            /* L1 eviction: write back to L2 */
+            extern Cache* l2_cache;
+            for (auto i = 0; i < line_size; i+=4) {
+               uint32_t val = (line.data[i+3] << 24) |
+                              (line.data[i+2] << 16) |
+                              (line.data[i+1] <<  8) |
+                              (line.data[i+0] <<  0);
+               l2_cache->write(line_addr + i, val);
+            }
+        } else {
+            /* L2 eviction: write back to memory */
+            for (auto i = 0; i < line_size; i+=4) {
+                mem_write_32(line_addr + i, (line.data[i+3] << 24) |
+                                            (line.data[i+2] << 16) |
+                                            (line.data[i+1] <<  8) |
+                                            (line.data[i+0] <<  0));
+            }
         }
     }
 
@@ -419,8 +436,9 @@ void Cache::fetch(uint32_t address, uint32_t tag, Cache_Line& line)
     /* Don't set them here - let the insertion policy decide */
 }
 
-uint32_t Cache::lookup(std::vector<Cache_Line>& set, uint32_t tag)
+uint32_t Cache::lookup(uint32_t set_index, uint32_t tag) const
 {
+    const auto& set = sets[set_index].lines;
     for (int way = 0; way < assoc; way++) {
         if (set[way].valid && set[way].tag == tag) {
             return way;
@@ -436,7 +454,7 @@ Cache_Result Cache::read(uint32_t address)
     decipher_address(address, line_size, num_sets, tag, set_index, offset);
     auto& set = sets[set_index].lines;
 
-    uint32_t way = lookup(set, tag);
+            uint32_t way = lookup(set_index, tag);
     if (way != UINT32_MAX) {
         /* Cache hit */
         update_on_hit(set_index, way);
@@ -452,10 +470,71 @@ Cache_Result Cache::read(uint32_t address)
                (set[way].data[offset+2] << 16) |
                (set[way].data[offset+1] <<  8) |
                (set[way].data[offset+0] <<  0)), 
-               0};
+               0, -1};
     }
 
     /* Cache miss */
+    /* For L1 caches, probe L2 first before fetching */
+    if (!is_l2()) {
+        /* Probe L2 cache */
+        Cache_Result l2_result = l2_cache->probe(address);
+        if (l2_result.latency >= 0) {
+            /* L2 hit - fill L1 from L2 and return L2 hit latency */
+            uint32_t victim_way = find_victim(set_index);
+            uint32_t victim_tick = set[victim_way].last_touch_tick;
+            
+            /* evict the victim way */
+            evict(tag, set_index, victim_way);
+            
+            /* Fill from L2 (data is in l2_result.data) */
+            /* Copy entire cache line from L2 */
+            uint32_t line_addr = address & ~(line_size - 1);
+            uint32_t l2_tag, l2_set_idx, l2_off;
+            decipher_address(line_addr, l2_cache->line_size, l2_cache->num_sets, l2_tag, l2_set_idx, l2_off);
+            auto& l2_set = l2_cache->get_set(l2_set_idx);
+            uint32_t l2_way = l2_cache->lookup(l2_set_idx, l2_tag);
+            if (l2_way != UINT32_MAX) {
+                /* Copy data from L2 to L1 */
+                for (uint32_t i = 0; i < line_size; i++) {
+                    set[victim_way].data[i] = l2_set.lines[l2_way].data[i];
+                }
+                set[victim_way].tag = tag;
+                set[victim_way].valid = true;
+                set[victim_way].dirty = false;
+            }
+            
+            /* Apply policy-specific insertion logic */
+            insert_line(set_index, victim_way, address, victim_tick);
+            
+            /* Update PSEL on miss for DIP and DRRIP */
+            if ((policy == POLICY_LRU || policy == POLICY_DRRIP) && psel_counter) {
+                bool is_leader_0 = is_leader_policy_0(set_index);
+                bool is_leader_1 = is_leader_policy_1(set_index);
+                update_psel_on_miss(set_index, is_leader_0, is_leader_1);
+            }
+            
+            /* Track statistics */
+            if (this == i_cache) {
+                stat_i_cache_read_misses++;
+            } else {
+                stat_d_cache_read_misses++;
+            }
+            
+            return {l2_result.data, l2_result.latency, -1};
+        } else {
+            /* L2 miss - need MSHR */
+            /* Don't fetch from memory yet - MSHR will handle it */
+            /* Track statistics */
+            if (this == i_cache) {
+                stat_i_cache_read_misses++;
+            } else {
+                stat_d_cache_read_misses++;
+            }
+            return {0, -1, -1};  /* latency=-1 means MSHR needed */
+        }
+    }
+    
+    /* L2 cache miss - fetch from memory */
     uint32_t victim_way = find_victim(set_index);
     uint32_t victim_tick = set[victim_way].last_touch_tick;
     
@@ -467,25 +546,19 @@ Cache_Result Cache::read(uint32_t address)
     /* Apply policy-specific insertion logic */
     insert_line(set_index, victim_way, address, victim_tick);
     
-    /* Update PSEL on miss for DIP and DRRIP */
-    if ((policy == POLICY_LRU || policy == POLICY_DRRIP) && psel_counter) {
-        bool is_leader_0 = is_leader_policy_0(set_index);
-        bool is_leader_1 = is_leader_policy_1(set_index);
-        update_psel_on_miss(set_index, is_leader_0, is_leader_1);
-    }
-    
-    /* Track statistics - determine if I-cache or D-cache */
+    /* Track statistics */
     if (this == i_cache) {
         stat_i_cache_read_misses++;
     } else {
         stat_d_cache_read_misses++;
     }
+    
     return {static_cast<uint32_t>(
            (set[victim_way].data[offset+3] << 24) |
            (set[victim_way].data[offset+2] << 16) |
            (set[victim_way].data[offset+1] <<  8) |
            (set[victim_way].data[offset+0] <<  0)), 
-           miss_penalty};
+           static_cast<int>(miss_penalty), -1};
 }
 
 Cache_Result Cache::write(uint32_t address, uint32_t value) 
@@ -494,7 +567,7 @@ Cache_Result Cache::write(uint32_t address, uint32_t value)
     decipher_address(address, line_size, num_sets, tag, set_index, offset);
     auto& set = sets[set_index].lines;
 
-    uint32_t way = lookup(set, tag);
+            uint32_t way = lookup(set_index, tag);
     if (way != UINT32_MAX) {
         /* Cache hit */
         update_on_hit(set_index, way);
@@ -511,10 +584,69 @@ Cache_Result Cache::write(uint32_t address, uint32_t value)
         } else {
             stat_d_cache_write_hits++;
         }
-        return {0, 0};
+        return {0, 0, -1};
     }
 
     /* Cache miss */
+    /* For L1 caches, probe L2 first before fetching */
+    if (!is_l2()) {
+        /* Probe L2 cache */
+        Cache_Result l2_result = l2_cache->probe(address);
+        if (l2_result.latency >= 0) {
+            /* L2 hit - fill L1 from L2 and return L2 hit latency */
+            uint32_t victim_way = find_victim(set_index);
+            uint32_t victim_tick = set[victim_way].last_touch_tick;
+            
+            evict(tag, set_index, victim_way);
+            
+            /* Fill from L2 */
+            uint32_t line_addr = address & ~(line_size - 1);
+            uint32_t l2_tag, l2_set_idx, l2_off;
+            decipher_address(line_addr, l2_cache->line_size, l2_cache->num_sets, l2_tag, l2_set_idx, l2_off);
+            auto& l2_set = l2_cache->get_set(l2_set_idx);
+            uint32_t l2_way = l2_cache->lookup(l2_set_idx, l2_tag);
+            if (l2_way != UINT32_MAX) {
+                /* Copy data from L2 to L1 */
+                for (uint32_t i = 0; i < line_size; i++) {
+                    set[victim_way].data[i] = l2_set.lines[l2_way].data[i];
+                }
+                set[victim_way].tag = tag;
+                set[victim_way].valid = true;
+                set[victim_way].dirty = false;
+            }
+            
+            /* Apply policy-specific insertion logic */
+            insert_line(set_index, victim_way, address, victim_tick);
+            
+            /* Write the value */
+            set[victim_way].dirty = true;
+            set[victim_way].data[offset+3] = (value >> 24) & 0xFF;
+            set[victim_way].data[offset+2] = (value >> 16) & 0xFF;
+            set[victim_way].data[offset+1] = (value >>  8) & 0xFF;
+            set[victim_way].data[offset+0] = (value >>  0) & 0xFF;
+            
+            /* Track statistics */
+            if (this == i_cache) {
+                stat_i_cache_write_misses++;
+            } else {
+                stat_d_cache_write_misses++;
+            }
+            
+            return {0, l2_result.latency, -1};
+        } else {
+            /* L2 miss - need MSHR */
+            /* Don't fetch from memory yet - MSHR will handle it */
+            /* Track statistics */
+            if (this == i_cache) {
+                stat_i_cache_write_misses++;
+            } else {
+                stat_d_cache_write_misses++;
+            }
+            return {0, -1, -1};  /* latency=-1 means MSHR needed */
+        }
+    }
+    
+    /* L2 cache miss - fetch from memory */
     uint32_t victim_way = find_victim(set_index);
     uint32_t victim_tick = set[victim_way].last_touch_tick;
     
@@ -525,25 +657,65 @@ Cache_Result Cache::write(uint32_t address, uint32_t value)
     /* Apply policy-specific insertion logic */
     insert_line(set_index, victim_way, address, victim_tick);
     
-    /* Update PSEL on miss for DIP and DRRIP */
-    if ((policy == POLICY_LRU || policy == POLICY_DRRIP) && psel_counter) {
-        bool is_leader_0 = is_leader_policy_0(set_index);
-        bool is_leader_1 = is_leader_policy_1(set_index);
-        update_psel_on_miss(set_index, is_leader_0, is_leader_1);
-    }
-    
     set[victim_way].dirty = true;
     set[victim_way].data[offset+3] = (value >> 24) & 0xFF;
     set[victim_way].data[offset+2] = (value >> 16) & 0xFF;
     set[victim_way].data[offset+1] = (value >>  8) & 0xFF;
     set[victim_way].data[offset+0] = (value >>  0) & 0xFF;
-    /* Track statistics - determine if I-cache or D-cache */
+    
+    /* Track statistics */
     if (this == i_cache) {
         stat_i_cache_write_misses++;
     } else {
         stat_d_cache_write_misses++;
     }
-    return {0, miss_penalty};
+    
+    return {0, static_cast<int>(miss_penalty), -1};
+}
+
+Cache_Result Cache::probe(uint32_t address)
+{
+    /* L2-specific: Probe cache without modifying state (for checking hit/miss) */
+    /* This is used by L1 caches to check L2 on miss */
+    uint32_t tag, set_index, offset;
+    decipher_address(address, line_size, num_sets, tag, set_index, offset);
+    
+    auto& set = sets[set_index].lines;
+            uint32_t way = lookup(set_index, tag);
+    if (way != UINT32_MAX) {
+        /* L2 hit - return hit latency */
+        /* Read data from L2 */
+        uint32_t data = (set[way].data[offset+3] << 24) |
+                       (set[way].data[offset+2] << 16) |
+                       (set[way].data[offset+1] <<  8) |
+                       (set[way].data[offset+0] <<  0);
+        return {data, L2_CACHE_HIT_LATENCY, -1};
+    }
+    
+    /* L2 miss */
+    return {0, -1, -1};
+}
+
+void Cache::fill_line(uint32_t address, uint32_t data)
+{
+    /* Fill a cache line (used by L2 when filling L1) */
+    uint32_t tag, set_index, offset;
+    decipher_address(address, line_size, num_sets, tag, set_index, offset);
+    auto& set = sets[set_index].lines;
+    
+    /* Find the line (should exist after L2 fill) */
+            uint32_t way = lookup(set_index, tag);
+    if (way != UINT32_MAX) {
+        /* Write data to cache line */
+        set[way].data[offset+3] = (data >> 24) & 0xFF;
+        set[way].data[offset+2] = (data >> 16) & 0xFF;
+        set[way].data[offset+1] = (data >>  8) & 0xFF;
+        set[way].data[offset+0] = (data >>  0) & 0xFF;
+        set[way].valid = true;
+        set[way].dirty = false;
+        /* Update LRU */
+        update_on_hit(set_index, way);
+    }
 }
 
 void Cache::flush()

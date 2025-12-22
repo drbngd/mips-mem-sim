@@ -6,12 +6,15 @@
  * Chris Fallin, 2012
  */
 
- #ifndef _PIPE_H_
- #define _PIPE_H_
- 
- #include "shell.h"
- #include <array>
- #include <memory>
+#ifndef _PIPE_H_
+#define _PIPE_H_
+
+#include "shell.h"
+#include <array>
+#include <memory>
+
+/* Forward declaration */
+class MSHRManager;
  
  /* Pipeline ops (instances of this structure) are high-level representations of
   * the instructions that actually flow through the pipeline. This struct does
@@ -106,6 +109,15 @@
    uint32_t pending_fetch_inst;  /* instruction fetched during I-cache miss */
    uint32_t pending_mem_data;    /* data read during D-cache miss */
    bool mem_cache_op_done;       /* true if mem stage cache op was already done (for stores) */
+   
+   /* MSHR tracking */
+   int fetch_mshr_index;  /* MSHR index for fetch stage (-1 if not waiting for MSHR) */
+   uint32_t fetch_l1_address;  /* L1 address waiting for fetch MSHR */
+   int mem_mshr_index;    /* MSHR index for mem stage (-1 if not waiting for MSHR) */
+   uint32_t mem_l1_address;  /* L1 address waiting for mem MSHR */
+   
+   /* MSHR manager instance */
+   MSHRManager* mshr_manager;
 
    /* place other information here as necessary */
 
@@ -113,7 +125,9 @@
    Pipe_State() : HI(0), LO(0), PC(0x00400000), 
                   branch_recover(0), branch_dest(0), branch_flush(0),
                   multiplier_stall(0), fetch_stall(0), mem_stall(0),
-                  pending_fetch_inst(0), pending_mem_data(0), mem_cache_op_done(false) {
+                  pending_fetch_inst(0), pending_mem_data(0), mem_cache_op_done(false),
+                  fetch_mshr_index(-1), fetch_l1_address(0),
+                  mem_mshr_index(-1), mem_l1_address(0), mshr_manager(nullptr) {
        REGS.fill(0);
    }
  };
@@ -124,8 +138,11 @@
  /* called during simulator startup */
  void pipe_init();
  
- /* this function calls the others */
- void pipe_cycle();
+/* this function calls the others */
+void pipe_cycle();
+
+/* Process completed MSHRs: fill L2 from memory, fill L1 from L2, unstall pipeline */
+void process_completed_mshrs();
  
  /* helper: pipe stages can call this to schedule a branch recovery */
  /* flushes 'flush' stages (1 = execute only, 2 = fetch/decode, ...) and then

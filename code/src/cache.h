@@ -27,6 +27,21 @@ extern uint32_t stat_d_cache_write_hits;
 #define D_CACHE_NUM_SETS 256
 #define D_CACHE_ASSOC 8
 
+/* L2 Cache Configuration */
+#define L2_CACHE_NUM_SETS 512
+#define L2_CACHE_ASSOC 16
+#define L2_CACHE_HIT_LATENCY 15
+#define L2_TO_MEM_LATENCY 5
+#define MEM_TO_L2_LATENCY 5
+#define DRAM_LATENCY 100  /* Fixed DRAM latency for now */
+#define NUM_MSHRS 16
+
+/* Cache Level Enum */
+enum CacheLevel {
+    CACHE_L1 = 0,
+    CACHE_L2
+};
+
 /* Replacement Policy Enum */
 enum ReplacementPolicy {
     POLICY_LRU = 0,    /* Least Recently Used (default) */
@@ -50,7 +65,8 @@ enum ReplacementPolicy {
 
 struct Cache_Result {
     uint32_t data;
-    uint32_t latency;
+    int latency;        /* -1 means L2 miss, MSHR allocated */
+    int mshr_index;    /* If latency == -1, this is the MSHR index */
 };
 
 
@@ -98,11 +114,14 @@ class Cache {
 
 private:
     std::vector<Cache_Set> sets; /* pointer to sets in the cache */
-    uint32_t num_sets; /* number of sets in the cache */
     uint32_t assoc; /* associativity */
     uint32_t miss_penalty; /* miss penalty */
-    uint32_t line_size; /* line size */
+    CacheLevel level; /* Cache level (L1 or L2) */
     ReplacementPolicy policy; /* Current replacement policy */
+    
+public:
+    uint32_t num_sets; /* number of sets in the cache */
+    uint32_t line_size; /* line size */
     
     /* Policy-specific data structures (only allocated when needed) */
     uint32_t* psel_counter; /* Policy Selector counter (for set dueling in DIP/DRRIP) */
@@ -116,8 +135,8 @@ private:
     
     /* Unified victim selection function */
     uint32_t find_victim(uint32_t set_index);
-    uint32_t find_victim_lru(uint32_t set_index) const;
     uint32_t find_victim_rrip(uint32_t set_index);
+    
     
     /* Set dueling helper functions */
     bool is_leader_policy_0(uint32_t set_index) const;
@@ -128,20 +147,35 @@ private:
     /* Unified insertion function */
     void insert_line(uint32_t set_index, uint32_t way, uint32_t address, uint32_t victim_tick);
     
-    void evict(uint32_t tag, uint32_t set_index, uint32_t way);
-    void fetch(uint32_t address, uint32_t tag, Cache_Line& line);
-    uint32_t lookup(std::vector<Cache_Line>& set, uint32_t tag);
-    
     /* Unified hit update function */
     void update_on_hit(uint32_t set_index, uint32_t way);
 
 public:
-    Cache(uint32_t num_sets, uint32_t assoc, uint32_t line_size, uint32_t miss_penalty, ReplacementPolicy policy = POLICY_LRU);
+    Cache(uint32_t num_sets, uint32_t assoc, uint32_t line_size, uint32_t miss_penalty, ReplacementPolicy policy = POLICY_LRU, CacheLevel level = CACHE_L1);
     ~Cache();
     
     /* Delete copy constructor and assignment operator to prevent Rule of Three violations */
     Cache(const Cache&) = delete;
     Cache& operator=(const Cache&) = delete;
+    
+    /* Check if this is an L2 cache */
+    bool is_l2() const { return level == CACHE_L2; }
+    
+    /* L2-specific: Probe cache without modifying state (for checking hit/miss) */
+    Cache_Result probe(uint32_t address);
+    
+    /* Fill a cache line (used by L2 when filling L1) */
+    void fill_line(uint32_t address, uint32_t data);
+    
+    /* Public accessors for L2 cache operations */
+    Cache_Set& get_set(uint32_t set_index) { return sets[set_index]; }
+    const Cache_Set& get_set(uint32_t set_index) const { return sets[set_index]; }
+    
+    /* Public methods for L2 cache management */
+    uint32_t find_victim_lru(uint32_t set_index) const;
+    void evict(uint32_t tag, uint32_t set_index, uint32_t way);
+    void fetch(uint32_t address, uint32_t tag, Cache_Line& line);
+    uint32_t lookup(uint32_t set_index, uint32_t tag) const;
     
     Cache_Result read(uint32_t address);
     Cache_Result write(uint32_t address, uint32_t value);

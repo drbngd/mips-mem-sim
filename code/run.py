@@ -7,7 +7,7 @@
 
 import sys, os, subprocess, re, glob, argparse
 
-ref = "./basesim"
+ref = "./sim-l1"
 sim = "./sim"
 
 bold="\033[1m"
@@ -79,7 +79,7 @@ def run(i):
 
 def filter_stats(out):
     lines = out.split("\n")
-    regex = re.compile("^(HI:)|(LO:)|(R\d+:)|(PC:)|(Cycles:)|(Fetched\w+:)|(Retired\w+:)|(IPC:)|(Flushes:).*$")
+    regex = re.compile(r"^(HI:)|(LO:)|(R\d+:)|(PC:)|(Cycles:)|(Fetched\w+:)|(Retired\w+:)|(IPC:)|(Flushes:).*$")
     out = []
     for l in lines:
         if regex.match(l):

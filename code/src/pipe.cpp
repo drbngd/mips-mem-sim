@@ -10,6 +10,7 @@
  #include "shell.h"
  #include "mips.h"
  #include "cache.h"
+ #include "mshr.h"
  #include <cstdio>
  #include <cstring>
  #include <cstdlib>
@@ -17,7 +18,7 @@
  #include <memory>
  #include <array>
  
- //#define DEBUG
+//  #define DEBUG
  
  /* debug */
  void print_op(Pipe_Op *op)
@@ -33,38 +34,57 @@
  /* global pipeline state */
  Pipe_State pipe;
  
- void pipe_init()
- {
-     pipe = Pipe_State();
- }
+void pipe_init()
+{
+    pipe = Pipe_State();
+    /* Initialize MSHR manager with L2 cache line size */
+    extern Cache* l2_cache;
+    pipe.mshr_manager = new MSHRManager(l2_cache->line_size);
+}
  
- void pipe_cycle()
- {
- #ifdef DEBUG
-     printf("\n\n----\n\nPIPELINE:\n");
-     printf("DCODE: "); print_op(pipe.decode_op);
-     printf("EXEC : "); print_op(pipe.execute_op);
-     printf("MEM  : "); print_op(pipe.mem_op);
-     printf("WB   : "); print_op(pipe.wb_op);
-     printf("\n");
- #endif
- 
-     pipe_stage_wb();
-     pipe_stage_mem();
-     pipe_stage_execute();
-     pipe_stage_decode();
-     pipe_stage_fetch();
+void pipe_cycle()
+{
+#ifdef DEBUG
+    printf("\n\n---- Cycle %u ----\n", stat_cycles);
+    printf("PC=0x%08x, fetch_stall=%d, mem_stall=%d, fetch_mshr=%d, mem_mshr=%d\n",
+           pipe.PC, pipe.fetch_stall, pipe.mem_stall, pipe.fetch_mshr_index, pipe.mem_mshr_index);
+    printf("PIPELINE:\n");
+    printf("DCODE: "); print_op(pipe.decode_op.get());
+    printf("EXEC : "); print_op(pipe.execute_op.get());
+    printf("MEM  : "); print_op(pipe.mem_op.get());
+    printf("WB   : "); print_op(pipe.wb_op.get());
+    printf("\n");
+#endif
+
+    /* Process MSHRs first - update states and handle completions */
+    /* This allows stages to react to MSHR completions in the same cycle */
+    if (pipe.mshr_manager) {
+        pipe.mshr_manager->process_cycle();
+        process_completed_mshrs();
+    }
+
+    /* Process pipe stages after MSHRs */
+    pipe_stage_wb();
+    pipe_stage_mem();
+    pipe_stage_execute();
+    pipe_stage_decode();
+    pipe_stage_fetch();
  
     /* handle branch recoveries */
     if (pipe.branch_recover) {
-#ifdef DEBUG
-        printf("branch recovery: new dest %08x flush %d stages\n", pipe.branch_dest, pipe.branch_flush);
-#endif
-
+        uint32_t old_pc = pipe.PC;
         pipe.PC = pipe.branch_dest;
 
         /* Clear fetch stall since we're fetching from new PC */
         pipe.fetch_stall = 0;
+        if (pipe.fetch_mshr_index >= 0) {
+            pipe.mshr_manager->free(pipe.fetch_mshr_index);
+        }
+        pipe.fetch_mshr_index = -1;  /* Clear MSHR tracking */
+#ifdef DEBUG
+        printf("[BRANCH] Recovery: PC 0x%08x -> 0x%08x, flush %d stages, fetch_stall=%d, fetch_mshr_index=%d\n",
+               old_pc, pipe.PC, pipe.branch_flush, pipe.fetch_stall, pipe.fetch_mshr_index);
+#endif
 
         if (pipe.branch_flush >= 2) {
             pipe.decode_op.reset();
@@ -78,6 +98,12 @@
             pipe.mem_op.reset();
             pipe.mem_stall = 0;  /* Clear mem stall if mem stage is flushed */
             pipe.mem_cache_op_done = false;
+            
+            /* Free MSHR if it exists */
+            if (pipe.mem_mshr_index >= 0) {
+                pipe.mshr_manager->free(pipe.mem_mshr_index);
+            }
+            pipe.mem_mshr_index = -1;  /* Clear MSHR tracking */
         }
 
         if (pipe.branch_flush >= 5) {
@@ -90,9 +116,102 @@
 
         stat_squash++;
     }
- }
- 
- void pipe_recover(int flush, uint32_t dest)
+}
+
+void process_completed_mshrs()
+{
+    if (!pipe.mshr_manager) return;
+    
+    extern Cache* l2_cache;
+    
+    /* Process MSHRs: mem first, then fetch (MEM stage before FETCH stage) */
+    struct MSHRInfo {
+        int* mshr_index_ptr;
+        uint32_t* l1_addr_ptr;
+        Cache* l1_cache;
+        uint32_t* pending_data_ptr;
+        int* stall_ptr;
+        bool* cache_op_done_ptr;
+        bool is_fetch;
+        const char* debug_name;
+    };
+    
+    MSHRInfo mshrs_to_process[] = {
+        {&pipe.mem_mshr_index, &pipe.mem_l1_address, d_cache, &pipe.pending_mem_data, 
+         &pipe.mem_stall, &pipe.mem_cache_op_done, false, "Mem"},
+        {&pipe.fetch_mshr_index, &pipe.fetch_l1_address, i_cache, &pipe.pending_fetch_inst,
+         &pipe.fetch_stall, nullptr, true, "Fetch"}
+    };
+    
+    for (auto& info : mshrs_to_process) {
+        if (*info.mshr_index_ptr >= 0 && pipe.mshr_manager->is_ready(*info.mshr_index_ptr)) {
+            MSHR* mshr = pipe.mshr_manager->get_mshr(*info.mshr_index_ptr);
+            if (mshr) {
+#ifdef DEBUG
+                if (info.is_fetch) {
+                    printf("[MSHR] %s MSHR %d completed: addr=0x%08x, l1_addr=0x%08x, PC=0x%08x\n",
+                           info.debug_name, *info.mshr_index_ptr, mshr->address, *info.l1_addr_ptr, pipe.PC);
+                } else {
+                    printf("[MSHR] %s MSHR %d completed: addr=0x%08x, l1_addr=0x%08x\n",
+                           info.debug_name, *info.mshr_index_ptr, mshr->address, *info.l1_addr_ptr);
+                }
+#endif
+                /* Fill L2 cache with data from MSHR buffer */
+                uint32_t line_addr = mshr->address;
+                uint32_t tag, set_index, offset;
+                decipher_address(line_addr, l2_cache->line_size, l2_cache->num_sets, tag, set_index, offset);
+                
+                /* Find victim in L2 */
+                uint32_t victim_way = l2_cache->find_victim_lru(set_index);
+                
+                /* Evict victim if needed */
+                auto& l2_set = l2_cache->get_set(set_index);
+                if (l2_set.lines[victim_way].valid) {
+                    uint32_t victim_tag = l2_set.lines[victim_way].tag;
+                    l2_cache->evict(victim_tag, set_index, victim_way);
+                }
+                
+                /* Copy data from MSHR buffer into L2 */
+                for (uint32_t i = 0; i < l2_cache->line_size; i++) {
+                    l2_set.lines[victim_way].data[i] = mshr->data[i];
+                }
+                
+                /* Insert at MRU position in L2 */
+                l2_set.lines[victim_way].tag = tag;
+                l2_set.lines[victim_way].valid = true;
+                l2_set.lines[victim_way].dirty = false;
+                l2_set.lines[victim_way].last_touch_tick = stat_cycles;
+                
+                /* Fill L1 from L2 - we just filled L2, so read directly from victim_way */
+                uint32_t l1_addr = *info.l1_addr_ptr;
+                uint32_t l2_offset = l1_addr & (l2_cache->line_size - 1);
+                uint32_t data = (l2_set.lines[victim_way].data[l2_offset+3] << 24) |
+                               (l2_set.lines[victim_way].data[l2_offset+2] << 16) |
+                               (l2_set.lines[victim_way].data[l2_offset+1] <<  8) |
+                               (l2_set.lines[victim_way].data[l2_offset+0] <<  0);
+                info.l1_cache->fill_line(l1_addr, data);
+                
+                /* Update pipeline state */
+                *info.pending_data_ptr = data;
+                *info.stall_ptr = 1;  /* Set to 1 so stage decrements it to 0 and handles it */
+                if (info.cache_op_done_ptr) {
+                    *info.cache_op_done_ptr = true;  /* Ensure flag is set so mem stage uses pending_mem_data */
+                }
+                
+#ifdef DEBUG
+                if (info.is_fetch) {
+                    printf("[MSHR] Fetch MSHR completed: inst=0x%08x, pending_fetch_inst=0x%08x, fetch_stall=%d, PC=0x%08x\n",
+                           data, *info.pending_data_ptr, *info.stall_ptr, pipe.PC);
+                }
+#endif
+                pipe.mshr_manager->free(*info.mshr_index_ptr);
+                *info.mshr_index_ptr = -1;
+            }
+        }
+    }
+}
+
+void pipe_recover(int flush, uint32_t dest)
  {
      /* if there is already a recovery scheduled, it must have come from a later
       * stage (which executes older instructions), hence that recovery overrides
@@ -127,6 +246,14 @@
         if (op->reg_src1_value == 0xA) {
             pipe.PC = op->pc; /* fetch will do pc += 4, then we stop with correct PC */
             pipe.fetch_stall = 0;  /* Clear any pending fetch stall so PC gets incremented */
+            if (pipe.fetch_mshr_index >= 0) {
+                /* Free the MSHR */
+                pipe.mshr_manager->free(pipe.fetch_mshr_index);
+                pipe.fetch_mshr_index = -1;
+            }
+#ifdef DEBUG
+            printf("[WB] Syscall exit: setting PC=0x%08x, fetch_stall=%d\n", pipe.PC, pipe.fetch_stall);
+#endif
             RUN_BIT = false;
         }
     }
@@ -139,6 +266,11 @@
  
 void pipe_stage_mem()
 {
+    /* If waiting for MSHR, check if it completed (handled in pipe_cycle) */
+    if (pipe.mem_mshr_index >= 0) {
+        return;  /* Still waiting for MSHR */
+    }
+    
     /* if we're stalling on a D-cache miss, decrement and check */
     if (pipe.mem_stall > 0) {
         pipe.mem_stall--;
@@ -160,8 +292,10 @@ void pipe_stage_mem()
             /* Cache op was done before stall, use pending data */
             if (op->opcode != OP_SW) {
                 val = pipe.pending_mem_data;
+            } else {
+                /* For SW, cache was filled (by L2 hit or MSHR), now perform the write */
+                d_cache->write(op->mem_addr & ~3, op->mem_value);
             }
-            /* For SW, write was already done - nothing more to do */
         } else {
             /* First time accessing cache for this instruction */
             /* For loads and sub-word stores (SB, SH), we need to read first */
@@ -169,7 +303,28 @@ void pipe_stage_mem()
             if (op->opcode == OP_SW) {
                 /* SW: write full word to cache */
                 Cache_Result result = d_cache->write(op->mem_addr & ~3, op->mem_value);
+                
+                /* Handle L2 miss (latency = -1 means MSHR needed) */
+                if (result.latency == -1) {
+                    /* L2 miss - allocate MSHR (use L2 line size for alignment) */
+                    extern Cache* l2_cache;
+                    uint32_t line_addr = (op->mem_addr & ~3) & ~(l2_cache->line_size - 1);
+                    int mshr_idx = pipe.mshr_manager->allocate(line_addr);
+                    if (mshr_idx >= 0) {
+                        pipe.mem_l1_address = op->mem_addr & ~3;  /* Store L1 address */
+                        pipe.mem_mshr_index = mshr_idx;
+                        pipe.mem_stall = 9999;  /* Large value - MSHR will set to 0 when done */
+                        pipe.mem_cache_op_done = true;  /* Wait for MSHR, then retry write */
+                    } else {
+                        /* No free MSHR - stall pipeline */
+                        pipe.mem_stall = 1;  /* Try again next cycle */
+                    }
+                    return;
+                }
+                
                 if (result.latency > 0) {
+                    /* L2 hit - fill D-cache from L2 */
+                    d_cache->fill_line(op->mem_addr & ~3, 0);  /* Write will happen after fill */
                     pipe.mem_cache_op_done = true;  /* don't write again after stall */
                     pipe.mem_stall = result.latency - 1;
                     return;
@@ -177,7 +332,29 @@ void pipe_stage_mem()
             } else {
                 /* All other memory ops need to read first */
                 Cache_Result result = d_cache->read(op->mem_addr & ~3);
+                
+                /* Handle L2 miss (latency = -1 means MSHR needed) */
+                if (result.latency == -1) {
+                    /* L2 miss - allocate MSHR (use L2 line size for alignment) */
+                    extern Cache* l2_cache;
+                    uint32_t line_addr = (op->mem_addr & ~3) & ~(l2_cache->line_size - 1);
+                    int mshr_idx = pipe.mshr_manager->allocate(line_addr);
+                    if (mshr_idx >= 0) {
+                        pipe.mem_mshr_index = mshr_idx;
+                        pipe.mem_l1_address = op->mem_addr & ~3;  /* Store L1 address */
+                        pipe.mem_stall = 9999;  /* Large value - MSHR will set to 0 when done */
+                        pipe.pending_mem_data = 0;  /* Will be filled by MSHR completion */
+                        pipe.mem_cache_op_done = true;
+                    } else {
+                        /* No free MSHR - stall pipeline */
+                        pipe.mem_stall = 1;  /* Try again next cycle */
+                    }
+                    return;
+                }
+                
                 if (result.latency > 0) {
+                    /* L2 hit - fill D-cache from L2 */
+                    d_cache->fill_line(op->mem_addr & ~3, result.data);
                     pipe.pending_mem_data = result.data;  /* save for after stall */
                     pipe.mem_cache_op_done = true;
                     pipe.mem_stall = result.latency - 1;
@@ -712,22 +889,39 @@ void pipe_stage_mem()
  
 void pipe_stage_fetch()
 {
+    /* If waiting for MSHR, check if it completed (handled in pipe_cycle) */
+    if (pipe.fetch_mshr_index >= 0) {
+        return;  /* Still waiting for MSHR */
+    }
+    
     /* if we're stalling on an I-cache miss, decrement and check */
     if (pipe.fetch_stall > 0) {
         pipe.fetch_stall--;
+#ifdef DEBUG
+        printf("[FETCH] Stall countdown: fetch_stall=%d, pending_fetch_inst=0x%08x, PC=0x%08x\n",
+               pipe.fetch_stall, pipe.pending_fetch_inst, pipe.PC);
+#endif
         if (pipe.fetch_stall > 0) return;  /* still waiting for memory */
         
         /* Stall just ended - instruction is already in pending_fetch_inst */
         if (pipe.decode_op) return;  /* downstream stall */
         
         auto op = std::make_unique<Pipe_Op>();
-        op->instruction = pipe.pending_fetch_inst;
+        uint32_t inst = pipe.pending_fetch_inst;
+        op->instruction = inst;
         op->pc = pipe.PC;
-        pipe.decode_op = std::move(op);
+        uint32_t old_pc = pipe.PC;
         pipe.PC += 4;
+        pipe.pending_fetch_inst = 0;  /* Clear pending */
+        pipe.decode_op = std::move(op);
         stat_inst_fetch++;
+#ifdef DEBUG
+        printf("[FETCH] Stall ended: fetched inst=0x%08x, PC: 0x%08x -> 0x%08x\n",
+               inst, old_pc, pipe.PC);
+#endif
         return;
     }
+    
 
     /* if pipeline is stalled (our output slot is not empty), return */
     if (pipe.decode_op)
@@ -735,11 +929,46 @@ void pipe_stage_fetch()
 
     /* Access instruction cache */
     Cache_Result result = i_cache->read(pipe.PC);
+#ifdef DEBUG
+    printf("[FETCH] Cache read PC=0x%08x: latency=%d, data=0x%08x\n", pipe.PC, result.latency, result.data);
+#endif
 
-    /* If cache miss, store the instruction and start stalling */
-    if (result.latency > 0) {
+    /* Handle L2 miss (latency = -1 means MSHR needed) */
+    /* RUN_BIT ensures we don't allocate MSHRs on final cycle */
+    if (result.latency == -1 && RUN_BIT) {
+        /* L2 miss - allocate MSHR (use L2 line size for alignment) */
+        extern Cache* l2_cache;
+        uint32_t line_addr = pipe.PC & ~(l2_cache->line_size - 1);
+        int mshr_idx = pipe.mshr_manager->allocate(line_addr);
+        if (mshr_idx >= 0) {
+            pipe.fetch_mshr_index = mshr_idx;
+            pipe.fetch_l1_address = pipe.PC;  /* Store L1 address */
+            pipe.fetch_stall = 9999;  /* Large value - MSHR will set to 0 when done */
+            pipe.pending_fetch_inst = 0;  /* Will be filled by MSHR completion */
+#ifdef DEBUG
+            printf("[FETCH] L2 miss: allocated MSHR %d, line_addr=0x%08x, PC=0x%08x, fetch_stall=%d\n",
+                   mshr_idx, line_addr, pipe.PC, pipe.fetch_stall);
+#endif
+        } else {
+            /* No free MSHR - stall pipeline */
+            pipe.fetch_stall = 1;  /* Try again next cycle */
+#ifdef DEBUG
+            printf("[FETCH] L2 miss: no free MSHR, stalling, PC=0x%08x\n", pipe.PC);
+#endif
+        }
+        return;
+    }
+
+    /* If cache miss (L2 hit), store the instruction and start stalling */
+    if (result.latency > 0 && RUN_BIT) { /* RUN_BIT ensures we don't stall on final cycle */
+        /* L2 hit - fill I-cache from L2 */
+        i_cache->fill_line(pipe.PC, result.data);
         pipe.pending_fetch_inst = result.data;  /* save for after stall */
         pipe.fetch_stall = result.latency - 1;  /* -1 because this cycle counts */
+#ifdef DEBUG
+        printf("[FETCH] L2 hit: inst=0x%08x, fetch_stall=%d, PC=0x%08x\n",
+               result.data, pipe.fetch_stall, pipe.PC);
+#endif
         return;
     }
 
@@ -750,7 +979,11 @@ void pipe_stage_fetch()
     pipe.decode_op = std::move(op);
 
     /* update PC */
+    uint32_t old_pc = pipe.PC;
     pipe.PC += 4;
-
     stat_inst_fetch++;
+#ifdef DEBUG
+    printf("[FETCH] Cache hit: inst=0x%08x, PC: 0x%08x -> 0x%08x\n",
+           result.data, old_pc, pipe.PC);
+#endif
 }
