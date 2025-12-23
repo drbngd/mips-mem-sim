@@ -1,12 +1,12 @@
 #include "mshr.h"
 #include "cache.h"
-#include "shell.h"
-#include <algorithm>
+#include "dram.h"
+#include <stdio.h>
 #include <vector>
 
 // #define DEBUG
 
-MSHRManager::MSHRManager(uint32_t line_size) : line_size(line_size) {
+MSHRManager::MSHRManager(uint32_t line_size) : line_size(line_size), dram_ptr(nullptr) {
     for (int i = 0; i < NUM_MSHRS; i++) {
         mshrs[i].valid = false;
         mshrs[i].state = MSHR_IDLE;
@@ -22,7 +22,11 @@ MSHRManager::~MSHRManager() {
     // Nothing to clean up
 }
 
-int MSHRManager::allocate(uint32_t address) {
+void MSHRManager::set_dram_controller(DRAM_Controller* dram) {
+    this->dram_ptr = dram;
+}
+
+int MSHRManager::allocate(uint32_t address, bool is_write, bool is_inst_fetch) {
     /* Find first free MSHR */
     /* address should already be line-aligned */
     for (int i = 0; i < NUM_MSHRS; i++) {
@@ -31,12 +35,15 @@ int MSHRManager::allocate(uint32_t address) {
             mshrs[i].address = address & ~(line_size - 1);  /* Line-align */
             mshrs[i].state = MSHR_WAITING_SEND;
             mshrs[i].alloc_tick = stat_cycles;
-            mshrs[i].completion_cycle = stat_cycles + L2_TO_MEM_LATENCY + DRAM_LATENCY + MEM_TO_L2_LATENCY;
+            mshrs[i].completion_cycle = stat_cycles + L2_TO_MEM_LATENCY;
+            mshrs[i].is_write = is_write;
+            mshrs[i].is_inst_fetch = is_inst_fetch;
+            
             mshrs[i].dram_request_cycle = 0;
             mshrs[i].data.resize(line_size, 0);  /* Initialize/reset data buffer */
 #ifdef DEBUG
-            printf("[MSHR] Allocated MSHR %d: addr=0x%08x, alloc_tick=%u, completion_cycle=%u\n",
-                   i, mshrs[i].address, mshrs[i].alloc_tick, mshrs[i].completion_cycle);
+            printf("[MSHR %d] Allocated: addr=0x%08x, alloc=%u, is_write=%d\n",
+                   i, mshrs[i].address, mshrs[i].alloc_tick, is_write);
 #endif
             return i;
         }
@@ -84,10 +91,30 @@ bool MSHRManager::is_ready(int mshr_index) {
     return false;
 }
 
-void MSHRManager::process_cycle() {
-    /* Process MSHRs and update states only */
-    /* Pipeline will check is_ready() on MSHRs it's tracking */
+void MSHRManager::dram_complete(uint32_t address) {
+    /* DRAM has finished the request for this address */
+    /* Find the matching MSHR */
     
+    /* NOTE: We might have multiple MSHRs for the same address if we supported MSHR Coalescing 
+       properly, but the allocate() function blindly allocates new ones (bug/limitation).
+       OR the pipeline might issue multiple requests. 
+       We should find ALL MSHRs waiting for DRAM for this address. */
+       
+    for (int i = 0; i < NUM_MSHRS; i++) {
+        if (mshrs[i].valid && mshrs[i].address == address && mshrs[i].state == MSHR_WAITING_DRAM) {
+            /* Transition to Filling L2 */
+            mshrs[i].state = MSHR_WAITING_FILL;
+            mshrs[i].completion_cycle = stat_cycles + MEM_TO_L2_LATENCY;
+            
+#ifdef DEBUG
+            printf("[MSHR %d] DRAM Callback for 0x%08x -> Filling L2 (Done at %u)\n", 
+                    i, address, mshrs[i].completion_cycle);
+#endif
+        }
+    }
+}
+
+void MSHRManager::process_cycle() {
     for (int i = 0; i < NUM_MSHRS; i++) {
         if (!mshrs[i].valid) continue;
         
@@ -95,62 +122,54 @@ void MSHRManager::process_cycle() {
         
         switch (mshr.state) {
             case MSHR_WAITING_SEND:
-                /* Check if 5 cycles have passed since allocation */
-                if (stat_cycles >= mshr.alloc_tick + L2_TO_MEM_LATENCY) {
-                    /* Send DRAM request */
-                    mshr.dram_request_cycle = stat_cycles;
-                    mshr.state = MSHR_WAITING_DRAM;
-                    mshr.completion_cycle = stat_cycles + DRAM_LATENCY + MEM_TO_L2_LATENCY;
+                /* Check if L2->Mem delay is done */
+                if (stat_cycles >= mshr.completion_cycle) {
+                    /* Send to DRAM Controller */
+                    if (dram_ptr) {
+                        dram_ptr->enqueue_request(mshr.address, mshr.is_write, mshr.is_inst_fetch);
+                        mshr.state = MSHR_WAITING_DRAM;
 #ifdef DEBUG
-                    printf("[MSHR] MSHR %d: WAITING_SEND -> WAITING_DRAM (cycle %u, will complete at %u)\n",
-                           i, stat_cycles, mshr.completion_cycle);
+                        printf("[MSHR %d] Sent 0x%08x to DRAM\n", i, mshr.address);
 #endif
+                    } else {
+                        /* Start fallback fixed latency if no DRAM (legacy support/unit test) */
+                         mshr.state = MSHR_WAITING_DRAM; // Or Error
+                    }
                 }
                 break;
                 
             case MSHR_WAITING_DRAM:
-                /* Check if DRAM latency has passed */
-                if (stat_cycles >= mshr.dram_request_cycle + DRAM_LATENCY) {
-                    /* DRAM responded, now wait 5 cycles to fill L2 */
-                    mshr.state = MSHR_WAITING_FILL;
-                    mshr.completion_cycle = stat_cycles + MEM_TO_L2_LATENCY;
-#ifdef DEBUG
-                    printf("[MSHR] MSHR %d: WAITING_DRAM -> WAITING_FILL (cycle %u, will complete at %u)\n",
-                           i, stat_cycles, mshr.completion_cycle);
-#endif
-                }
+                /* Waiting for callback via dram_complete() */
+                /* Do nothing here */
                 break;
                 
             case MSHR_WAITING_FILL:
                 /* Check if fill latency has passed */
                 if (stat_cycles >= mshr.completion_cycle) {
-                    /* DRAM has delivered data - read from memory into MSHR buffer */
+                    
+                    /* Fetch Data from "Memory" (Gatekeeper) */
+                    /* Since DRAM Controller is the gatekeeper now, we should ask IT for data
+                       or just use the global mem_read since DRAM Controller allows that architectural bypass logic. */
                     extern uint32_t mem_read_32(uint32_t addr);
                     uint32_t line_base = mshr.address;
-                    for (uint32_t i = 0; i < line_size; i += 4) {
-                        uint32_t word = mem_read_32(line_base + i);
-                        mshr.data[i+3] = (word >> 24) & 0xFF;
-                        mshr.data[i+2] = (word >> 16) & 0xFF;
-                        mshr.data[i+1] = (word >>  8) & 0xFF;
-                        mshr.data[i+0] = (word >>  0) & 0xFF;
+                    for (uint32_t k = 0; k < line_size; k += 4) {
+                        /* Read directly from Shell memory as planned (Timing Model only) */
+                        uint32_t word = mem_read_32(line_base + k);
+                        mshr.data[k+3] = (word >> 24) & 0xFF;
+                        mshr.data[k+2] = (word >> 16) & 0xFF;
+                        mshr.data[k+1] = (word >>  8) & 0xFF;
+                        mshr.data[k+0] = (word >>  0) & 0xFF;
                     }
-                    /* Ready to fill L2 */
+                    
                     mshr.state = MSHR_READY;
-#ifdef DEBUG
-                    printf("[MSHR] MSHR %d: WAITING_FILL -> READY (cycle %u, addr=0x%08x)\n",
-                           i, stat_cycles, mshr.address);
-#endif
                 }
                 break;
                 
             case MSHR_READY:
-                /* Already ready - pipeline will handle it */
                 break;
                 
             case MSHR_IDLE:
-                /* Should not happen */
                 break;
         }
     }
 }
-

@@ -118,6 +118,9 @@ class MSHRManager;
    
    /* MSHR manager instance */
    MSHRManager* mshr_manager;
+   
+   /* DRAM Controller instance */
+   class DRAM_Controller* dram_controller;
 
    /* place other information here as necessary */
 
@@ -127,7 +130,8 @@ class MSHRManager;
                   multiplier_stall(0), fetch_stall(0), mem_stall(0),
                   pending_fetch_inst(0), pending_mem_data(0), mem_cache_op_done(false),
                   fetch_mshr_index(-1), fetch_l1_address(0),
-                  mem_mshr_index(-1), mem_l1_address(0), mshr_manager(nullptr) {
+                  mem_mshr_index(-1), mem_l1_address(0), mshr_manager(nullptr),
+                  dram_controller(nullptr) {
        REGS.fill(0);
    }
  };

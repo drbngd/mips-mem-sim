@@ -11,6 +11,7 @@
  #include "mips.h"
  #include "cache.h"
  #include "mshr.h"
+ #include "dram.h"
  #include <cstdio>
  #include <cstring>
  #include <cstdlib>
@@ -40,6 +41,12 @@ void pipe_init()
     /* Initialize MSHR manager with L2 cache line size */
     extern Cache* l2_cache;
     pipe.mshr_manager = new MSHRManager(l2_cache->line_size);
+    
+    /* Initialize DRAM Controller */
+    pipe.dram_controller = new DRAM_Controller();
+    
+    /* Connect MSHR to DRAM */
+    pipe.mshr_manager->set_dram_controller(pipe.dram_controller);
 }
  
 void pipe_cycle()
@@ -56,6 +63,15 @@ void pipe_cycle()
     printf("\n");
 #endif
 
+//     printf("Enter pipe_cycle %u\n", stat_cycles); fflush(stdout);
+
+    /* Process DRAM Controller */
+    if (pipe.dram_controller) {
+//         printf("DRAM process_cycle start\n"); fflush(stdout);
+        pipe.dram_controller->process_cycle(pipe.mshr_manager);
+//         printf("DRAM process_cycle end\n"); fflush(stdout);
+    }
+    
     /* Process MSHRs first - update states and handle completions */
     /* This allows stages to react to MSHR completions in the same cycle */
     if (pipe.mshr_manager) {
@@ -69,6 +85,9 @@ void pipe_cycle()
     pipe_stage_execute();
     pipe_stage_decode();
     pipe_stage_fetch();
+    
+//     printf("Exit pipe_cycle %u\n", stat_cycles); fflush(stdout);
+
  
     /* handle branch recoveries */
     if (pipe.branch_recover) {
@@ -309,9 +328,9 @@ void pipe_stage_mem()
                     /* L2 miss - allocate MSHR (use L2 line size for alignment) */
                     extern Cache* l2_cache;
                     uint32_t line_addr = (op->mem_addr & ~3) & ~(l2_cache->line_size - 1);
-                    int mshr_idx = pipe.mshr_manager->allocate(line_addr);
+                    /* Allocate MSHR (Write=true, InstFetch=false) */
+                    int mshr_idx = pipe.mshr_manager->allocate(line_addr, true, false); // Write=true
                     if (mshr_idx >= 0) {
-                        pipe.mem_l1_address = op->mem_addr & ~3;  /* Store L1 address */
                         pipe.mem_mshr_index = mshr_idx;
                         pipe.mem_stall = 9999;  /* Large value - MSHR will set to 0 when done */
                         pipe.mem_cache_op_done = true;  /* Wait for MSHR, then retry write */
@@ -338,7 +357,8 @@ void pipe_stage_mem()
                     /* L2 miss - allocate MSHR (use L2 line size for alignment) */
                     extern Cache* l2_cache;
                     uint32_t line_addr = (op->mem_addr & ~3) & ~(l2_cache->line_size - 1);
-                    int mshr_idx = pipe.mshr_manager->allocate(line_addr);
+                    /* Allocate MSHR (Write=false, InstFetch=false) */
+                    int mshr_idx = pipe.mshr_manager->allocate(line_addr, false, false); // Write=false
                     if (mshr_idx >= 0) {
                         pipe.mem_mshr_index = mshr_idx;
                         pipe.mem_l1_address = op->mem_addr & ~3;  /* Store L1 address */
@@ -939,7 +959,8 @@ void pipe_stage_fetch()
         /* L2 miss - allocate MSHR (use L2 line size for alignment) */
         extern Cache* l2_cache;
         uint32_t line_addr = pipe.PC & ~(l2_cache->line_size - 1);
-        int mshr_idx = pipe.mshr_manager->allocate(line_addr);
+        /* Allocate MSHR (Write=false, InstFetch=true) */
+        int mshr_idx = pipe.mshr_manager->allocate(line_addr, false, true); // InstFetch=true
         if (mshr_idx >= 0) {
             pipe.fetch_mshr_index = mshr_idx;
             pipe.fetch_l1_address = pipe.PC;  /* Store L1 address */
