@@ -13,7 +13,11 @@
 #include <cstdio>
 #include <cstring>
 
-Core::Core(int id, Processor* p) : id(id), proc(p), is_running(false) {
+Core::Core(int id, Processor* p, L2Cache* l2) 
+    : id(id), proc(p), is_running(false),
+      icache(id, l2, L1_I_SETS, L1_I_ASSOC), 
+      dcache(id, l2, L1_D_SETS, L1_D_ASSOC)
+{
     pipe = std::make_unique<Pipeline>(this);
     
     /* CPU 0 starts running by default */
@@ -37,7 +41,9 @@ void Core::cycle() {
     pipe->mem();
     pipe->execute();
     pipe->decode();
-    pipe->fetch();
+        
+    if (is_running)
+        pipe->fetch();
 
     /* handle branch recoveries */
     if (pipe->branch_recover) {
@@ -77,7 +83,7 @@ void Core::handle_syscall(Pipe_Op* op) {
 
     if (v0 == 0xA) {
         /* Syscall 10: Halt current CPU */
-        pipe->PC = op->pc; /* fetch will do pc += 4, then we stop with correct PC */
+        pipe->PC = op->pc + 4; /* fetch will do pc += 4, then we stop with correct PC */
         is_running = false;
     }
     else if (v0 == 0xB) {

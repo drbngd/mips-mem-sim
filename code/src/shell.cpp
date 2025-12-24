@@ -111,14 +111,16 @@ void mem_write_32(uint32_t address, uint32_t value)
 /*                                                             */
 /***************************************************************/
 void help() {                                                    
-  printf("----------------MIPS ISIM Help-----------------------\n");
-  printf("go                     -  run program to completion         \n");
-  printf("run n                  -  execute program for n instructions\n");
-  printf("rdump                  -  dump architectural registers      \n");
-  printf("mdump low high         -  dump memory from low to high      \n");
-  printf("input reg_no reg_value - set GPR reg_no to reg_value  \n");
-  printf("?                      -  display this help menu            \n");
-  printf("quit                   -  exit the program                  \n\n");
+  printf("----------------MIPS-SIM Help-------------------------\n");
+  printf("go                    -  run program to completion       \n");
+  printf("run n                 -  execute program for n cycles    \n");
+  printf("mdump low high        -  dump memory from low to high    \n");
+  printf("rdump                 -  dump the register & bus values  \n");
+  printf("input reg_num reg_val -  set GPR reg_num to reg_val      \n");
+  printf("high value            -  set the HI register to value    \n");
+  printf("low value             -  set the LO register to value    \n");
+  printf("?                     -  display this help menu          \n");
+  printf("quit                  -  exit the program                \n\n");
 }
 
 /***************************************************************/
@@ -128,14 +130,14 @@ void help() {
 /* Purpose   : Execute a cycle                                 */
 /*                                                             */
 /***************************************************************/
-void cycle() {                                                
+void cycle() {                                                  
   P->cycle();
   stat_cycles++;
 }
 
 /***************************************************************/
 /*                                                             */
-/* Procedure : run n                                           */
+/* Procedure : run                                             */
 /*                                                             */
 /* Purpose   : Simulate the MIPS for n cycles                 */
 /*                                                             */
@@ -201,7 +203,7 @@ void rdump() {
     printf("IPC: %0.3f\n", ipc);
     printf("Flushes: %u\n", stat_squash);
 
-    for (int k = 1; k < 4; k++) {
+    for (int k = 1; k < NUM_CORES; k++) {
         printf("CPU %d:\n", k);
         auto& pipe_k = *(P->cores[k]->pipe);
         printf("PC: 0x%08x\n", pipe_k.PC);
@@ -381,6 +383,7 @@ void initialize(char *program_filename, int num_prog_files) {
 /*                                                             */
 /***************************************************************/
 int main(int argc, char *argv[]) {                              
+  setvbuf(stdout, NULL, _IONBF, 0);
 
   /* Error Checking */
   if (argc < 2) {

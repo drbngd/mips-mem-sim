@@ -10,6 +10,8 @@
 #define _PROCESSOR_H_
 
 #include "core.h"
+#include "cache.h"
+#include "dram.h"
 #include <vector>
 #include <memory>
 
@@ -19,6 +21,10 @@ public:
 
     /* Pointers to the 4 Cores */
     std::vector<std::unique_ptr<Core>> cores;
+    
+    /* Shared Memory Hierarchy */
+    L2Cache l2_cache;
+    DRAM dram;
 
     /* Ticks the entire system (all cores) */
     void cycle();

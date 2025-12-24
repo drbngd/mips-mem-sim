@@ -90,6 +90,17 @@ void Pipeline::mem()
     /* grab the op out of our input slot */
     Pipe_Op *op = mem_op.get();
 
+    /* Access D-Cache if this is a memory operation */
+    if (op->is_mem) {
+        bool is_write = op->mem_write; // You might need to verify if mem_write is set correctly in decode for all ops, but looking at decode() it seems so.
+        // wait, op->mem_write is set in decode for stores. For loads it is 0.
+        // Let's verify decode logic quickly in my head (or look at file). 
+        // Yes, `op->mem_write = 1` for stores, `0` for loads.
+        
+        if (!core->dcache.access(op->mem_addr, op->mem_write, true))
+            return;
+    }
+
     uint32_t val = 0;
     if (op->is_mem)
         val = mem_read_32(op->mem_addr & ~3);
@@ -612,6 +623,10 @@ void Pipeline::fetch()
 {
     /* if pipeline is stalled (our output slot is not empty), return */
     if (decode_op)
+        return;
+
+    /* Check I-Cache */
+    if (!core->icache.access(PC, false, false))
         return;
 
     /* Allocate an op and send it down the pipeline. */
