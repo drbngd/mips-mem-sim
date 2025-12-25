@@ -35,7 +35,7 @@ uint32_t DRAM::get_flat_bank_id(uint32_t addr) const {
     return m.bank;
 }
 
-bool DRAM::enqueue(bool is_write, uint32_t addr, int core_id, DRAM_Req::Source src) {
+bool DRAM::enqueue(bool is_write, uint32_t addr, int core_id, DRAM_Req::Source src, uint64_t cycle) {
     uint32_t bank_id = get_flat_bank_id(addr);
     AddressMapping mapping = decode(addr);
     
@@ -45,7 +45,7 @@ bool DRAM::enqueue(bool is_write, uint32_t addr, int core_id, DRAM_Req::Source s
     req.addr = addr;
     req.is_write = is_write;
     req.core_id = core_id;
-    req.arrival_cycle = 0; // Will be set/used by processor if needed, but we track order by vector index
+    req.arrival_cycle = cycle; // Track arrival for Priority Rule 2
     req.completion_cycle = 0;
     
     req.bank_id = bank_id;
@@ -162,10 +162,27 @@ DRAM_Req DRAM::execute(uint64_t current_cycle) {
             best_cand_idx = i;
             best_is_row_hit = row_hit;
         } else {
+            DRAM_Req& best_req = active_requests[best_cand_idx];
+
             // Priority Check
             if (is_open_policy && row_hit != best_is_row_hit) {
                 if (row_hit) {
                      best_cand_idx = i; best_is_row_hit = true;
+                }
+            } 
+            else if (row_hit == best_is_row_hit) {
+                // Rule 1 Tie.
+                // Rule 2: Arrival Time.
+                if (req.arrival_cycle < best_req.arrival_cycle) {
+                    best_cand_idx = i;
+                    best_is_row_hit = row_hit;
+                } else if (req.arrival_cycle == best_req.arrival_cycle) {
+                    // Rule 2 Tie.
+                    // Rule 3: Source (Memory > Fetch)
+                    if (req.source == DRAM_Req::SRC_MEMORY && best_req.source == DRAM_Req::SRC_FETCH) {
+                        best_cand_idx = i;
+                        best_is_row_hit = row_hit;
+                    }
                 }
             } 
         }

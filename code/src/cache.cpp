@@ -188,19 +188,36 @@ int L2Cache::allocate_mshr(uint32_t addr, bool is_write, int core_id) {
 }
 
 int L2Cache::access(uint32_t addr, bool is_write, int core_id) {
-    // 1. Check Cache Hit
+    // 1. Spec: "A free MSHR is a prerequisite for an access to the L2 cache"
+    // Check if we can allocate OR if it's already pending (merge).
+    // If not merged and valid MSHRs full, we must stall.
+    
+    int pending_idx = check_mshr(addr);
+    
+    // If NOT pending and MSHRs full, we can't even probe.
+    if (pending_idx == -1) {
+        // Check for free slot
+        bool free_slot = false;
+        for (int i=0; i<L2_MSHR_SIZE; i++) {
+            if (!mshrs[i].valid) { free_slot = true; break; }
+        }
+        if (!free_slot) return L2_BUSY;
+    }
+
+    // 2. Check Cache Hit
     if (is_write) {
         if (probe_write(addr, nullptr)) return L2_HIT; // Hit
     } else {
         if (probe_read(addr) != nullptr) return L2_HIT; // Hit
     }
 
-    // 2. Miss: Check MSHRs (Merge)
-    if (check_mshr(addr) != -1) {
+    // 3. Miss: Check MSHRs (Merge)
+    if (pending_idx != -1) {
         return L2_MISS; // Request already pending (merged)
     }
 
-    // 3. New Miss: Allocate MSHR
+    // 4. New Miss: Allocate MSHR
+    // We already checked for a free slot above.
     int mshr_idx = allocate_mshr(addr, is_write, core_id); 
     if (mshr_idx != -1) {
         // Enqueue to Request Queue (5 cycle delay)
@@ -214,7 +231,7 @@ int L2Cache::access(uint32_t addr, bool is_write, int core_id) {
         return L2_MISS; 
     }
 
-    // 4. MSHRs Full: Stall
+    // Should not reach here if logic holds
     return L2_BUSY;
 }
 
@@ -232,7 +249,7 @@ void L2Cache::cycle(uint64_t current_cycle, std::vector<std::unique_ptr<Core>>& 
         if (current_cycle >= it->ready_cycle) {
             // Send to DRAM
             if (dram_ref) {
-                dram_ref->enqueue(it->is_write, it->addr, it->core_id, DRAM_Req::SRC_MEMORY);
+                dram_ref->enqueue(it->is_write, it->addr, it->core_id, DRAM_Req::SRC_MEMORY, current_cycle);
             }
             it = req_queue.erase(it);
         } else {

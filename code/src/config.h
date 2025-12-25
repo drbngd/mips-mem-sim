@@ -38,7 +38,7 @@
 
 /* Cache Configuration */
 /* L1 Instruction Cache (8KB, 4-way, 32B) */
-#define L1_I_SETS 256
+#define L1_I_SETS 64
 #define L1_I_ASSOC 4
 #define L1_I_BLOCK_SIZE BLOCK_SIZE // Changed to use BLOCK_SIZE
 

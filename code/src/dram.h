@@ -64,7 +64,7 @@ public:
     uint32_t get_flat_bank_id(uint32_t addr) const;
 
     // Enqueue a request
-    bool enqueue(bool is_write, uint32_t addr, int core_id, DRAM_Req::Source src);
+    bool enqueue(bool is_write, uint32_t addr, int core_id, DRAM_Req::Source src, uint64_t cycle);
 
     // Execute the DRAM controller (formerly tick). Returns the completed request (valid=true if done).
     DRAM_Req execute(uint64_t current_cycle);
