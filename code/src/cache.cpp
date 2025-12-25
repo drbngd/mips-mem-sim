@@ -1,9 +1,7 @@
 #include "cache.h"
 #include "config.h"
 #include "core.h" // Needed for Core def
-#include <cstdio>
 #include <cstring>
-#include <algorithm>
 #include <cmath>
 
 extern uint32_t stat_cycles; // From shell.cpp

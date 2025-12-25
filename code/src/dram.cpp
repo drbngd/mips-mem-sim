@@ -1,6 +1,4 @@
 #include "dram.h"
-#include <cmath>
-// algorithm, iostream, optional removed as unused (manual loop implemented)
 
 DRAM::DRAM() : cmd_bus_avail_cycle(0), data_bus_avail_cycle(0) {
     // Banks initialized by default
