@@ -175,6 +175,9 @@ public:
     int check_mshr(uint32_t addr);
     int allocate_mshr(uint32_t addr, bool is_write, int core_id);
     void complete_mshr(uint32_t addr, std::vector<std::unique_ptr<class Core>>& cores);
+    
+    // Writeback Helper
+    void handle_l1_writeback(uint32_t addr, const std::vector<uint8_t>& data);
 };
 
 class L1Cache : public Cache {

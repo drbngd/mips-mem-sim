@@ -267,7 +267,7 @@ void L2Cache::cycle(uint64_t current_cycle, std::vector<std::unique_ptr<Core>>& 
     }
 }
 
-void L2Cache::complete_mshr(uint32_t addr, std::vector<std::unique_ptr<Core>>& cores) {
+void L2Cache::complete_mshr(uint32_t addr, std::vector<std::unique_ptr<class Core>>& cores) {
     uint32_t block_addr = addr & ~(block_size - 1);
     for (int i = 0; i < L2_MSHR_SIZE; i++) {
         if (mshrs[i].valid && mshrs[i].address == block_addr) {
@@ -276,7 +276,16 @@ void L2Cache::complete_mshr(uint32_t addr, std::vector<std::unique_ptr<Core>>& c
             // Install in L2
             bool dirty_evicted;
             uint32_t evicted_addr;
-            install(addr, nullptr, &dirty_evicted, &evicted_addr, nullptr);
+            std::vector<uint8_t> evicted_data;
+            
+            install(addr, nullptr, &dirty_evicted, &evicted_addr, &evicted_data);
+            
+            // Handle L2 Writeback to DRAM
+            if (dirty_evicted && dram_ref) {
+                 // Use stat_cycles. Spec: "Immediately written into main memory"
+                 // Note: L2 eviction goes to SRC_MEMORY.
+                 dram_ref->enqueue(true, evicted_addr, -1, DRAM_Req::SRC_MEMORY, stat_cycles);
+            }
             
             // Wake up L1
             // Use stored core_id
@@ -286,6 +295,19 @@ void L2Cache::complete_mshr(uint32_t addr, std::vector<std::unique_ptr<Core>>& c
                 cores[cid]->dcache.fill(addr);
             }
         }
+    }
+}
+
+void L2Cache::handle_l1_writeback(uint32_t addr, const std::vector<uint8_t>& data) {
+    // Probe L2 for Write
+    if (probe_write(addr, data.data())) {
+        // Hit: L2 updated (dirty bit set, LRU updated, data copied)
+        return;
+    }
+    
+    // Miss: Write directly to DRAM (Bypass L2 allocation)
+    if (dram_ref) {
+        dram_ref->enqueue(true, addr, -1, DRAM_Req::SRC_MEMORY, stat_cycles);
     }
 }
 
@@ -364,7 +386,10 @@ void L1Cache::fill(uint32_t addr) {
         
         install(pending_miss_addr, nullptr, &dirty_evicted, &evicted_addr, &evicted_data);
         
-        // Phase 3: Ignore writeback of evicted data for now (Clean/Dirty not fully utilized)
+        // Handle Writeback if dirty block was evicted
+        if (dirty_evicted) {
+             l2_ref->handle_l1_writeback(evicted_addr, evicted_data);
+        }
         
         pending_miss = false;
 #ifdef DEBUG
