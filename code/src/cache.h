@@ -4,6 +4,7 @@
 #include "config.h"
 #include "dram.h"
 #include "mshr.h"
+#include <memory>
 
 /* Usage:
  * I-Cache: Sets=L1_I_SETS (8KB, 4-way, 32B)
@@ -126,15 +127,19 @@ public:
     /* Allocates a new block. Returns pointer to block. 
      * Handles eviction if necessary. 
      * out_evicted_addr/data are populated if a dirty block was evicted. */
-    CacheBlock* install(uint32_t addr, const uint8_t* data, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data);
+    CacheBlock* install(uint32_t addr, const uint8_t* data, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data, bool writeback_clean = false);
     
-    /* Explicit eviction helper */
-    void evict(uint32_t set_idx, int way, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data);
+    /* Explicit eviction helper. 
+     * If writeback_clean is true, evicted_data is populated even if not dirty (for Victim Cache). 
+     */
+    virtual void evict(uint32_t set_idx, int way, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data, bool writeback_clean = false);
 };
 
 class L2Cache : public Cache {
 public:
-    InclusionPolicy incl_policy; 
+    InclusionPolicy incl_policy; // Configured via L2_INCL_POLICY
+    std::vector<class L1Cache*> l1_refs; // Pointers to L1s for invalidation/snooping
+    
     // MSHRs
     MSHR mshrs[L2_MSHR_SIZE];
     
@@ -161,9 +166,7 @@ public:
     // Returns L2_RET_xxx status
     int access(uint32_t addr, bool is_write, int core_id);
 
-#include <memory> /* for unique_ptr */
 
-// ... (inside class L2Cache)
 
     // Timing Cycle (processes queues)
     void cycle(uint64_t current_cycle, std::vector<std::unique_ptr<class Core>>& cores);
@@ -178,6 +181,9 @@ public:
     
     // Writeback Helper
     void handle_l1_writeback(uint32_t addr, const std::vector<uint8_t>& data);
+
+    // Override evict for Inclusive Policy
+    void evict(uint32_t set_idx, int way, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data, bool writeback_clean = false) override;
 };
 
 class L1Cache : public Cache {
@@ -185,22 +191,32 @@ public:
     int id;
     L2Cache* l2_ref;
     
-    // Blocking Logic for Phase 3
-    bool pending_miss;
-    uint32_t pending_miss_addr;
-    uint32_t pending_miss_ready_cycle;
+    // Blocking Logic for MESI (One MSHR)
+    MSHR mshr;
+    
+    // Parent core pointer for snooping other L1s
+    class Core* parent_core;
 
-    L1Cache(int core_id, L2Cache* l2, uint32_t s, uint32_t w);
+    L1Cache(int core_id, L2Cache* l2, class Core* core, uint32_t s, uint32_t w);
     
     // Returns true if hit/available. False if miss/pending.
-    // Logic: 
-    // - Check Tag. If Hit -> True.
-    // - If Miss -> Issue request to L2 (if not already pending). Return False.
-    // - If L2 busy -> Return False (Retry).
     bool access(uint32_t addr, bool is_write, bool is_data_cache);
     
     // Called when L2 fills the request
-    void fill(uint32_t addr);
+    // target_state: State to install the block in (SHARED/EXCLUSIVE/MODIFIED)
+    void fill(uint32_t addr, MESI_State target_state);
+
+    // Invalidate a specific block (used by L2 for Inclusive Policy / Coherence)
+    // Returns true if block was present and valid
+    bool invalidate(uint32_t addr);
+    
+    // Coherence Snoop (used by other L1s)
+    // Returns true if block was present (Shared/Exclusive/Modified).
+    // is_write_req: If true, invalidates local copy (Write Invalidate).
+    //               If false, downgrades to Shared (Read Miss).
+    // is_modified: Output, set to true if block was in MODIFIED state.
+    // data: Output, populated with dirty data if is_modified is true.
+    bool probe_coherence(uint32_t addr, bool is_write_req, bool* is_modified, std::vector<uint8_t>* data);
 };
 
 #endif

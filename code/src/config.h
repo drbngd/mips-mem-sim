@@ -10,12 +10,15 @@
 #define _CONFIG_H_
 
 /* System Configuration */
-#define NUM_CORES 1       /* Number of Cores */
+#define NUM_CORES 4       /* Number of Cores */
 #define DRAM_REQ_QUEUE_SIZE 32
 #define DRAM_CHANNEL_WIDTH 8 /* 64-bit channel */
 
 /* DRAM Configuration */
 #define DRAM_SIZE 0x4000 /* For simulated main memory array size */
+
+/* Shared Type Definitions for Configuration */
+/* Enums defined in cache.h */
 
 /* DRAM Organization */
 #define DRAM_CHANNELS 1
@@ -51,12 +54,12 @@
 #define L2_SIZE 262144
 #define L2_ASSOC 16
 #define L2_SETS (L2_SIZE / (L2_ASSOC * BLOCK_SIZE))
-#define L2_INCL_POLICY 2 /* NINE */
+#define L2_INCL_POLICY INCL_INCLUSIVE /* Inclusive */
 #define L2_MSHR_SIZE 16 /* Number of MSHRs */
 
 /* Policies */
 /* Replace with 0 (LRU), 1 (Random), etc. */
-#define CACHE_REPL_POLICY 0 // LRU
+#define CACHE_REPL_POLICY REPL_LRU // LRU
 
 /* L2 Latencies */
 #define L2_HIT_LATENCY 15

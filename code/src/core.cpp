@@ -6,6 +6,7 @@
  * Chris Fallin, 2012
  */
 
+
 #include "core.h"
 #include "processor.h"
 #include "shell.h"
@@ -15,8 +16,8 @@
 
 Core::Core(int id, Processor* p, L2Cache* l2) 
     : id(id), proc(p), is_running(false),
-      icache(id, l2, L1_I_SETS, L1_I_ASSOC), 
-      dcache(id, l2, L1_D_SETS, L1_D_ASSOC)
+      icache(id, l2, this, L1_I_SETS, L1_I_ASSOC), 
+      dcache(id, l2, this, L1_D_SETS, L1_D_ASSOC)
 {
     pipe = std::make_unique<Pipeline>(this);
     

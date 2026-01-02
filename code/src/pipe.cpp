@@ -10,7 +10,6 @@
 #include "shell.h"
 #include "mips.h"
 #include "core.h"
-#include "config.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -489,6 +488,27 @@ void Pipeline::decode()
     /* if no op to decode, return */
     if (!decode_op)
         return;
+
+    /* Check for SYSCALL serialization */
+    /* 1. If we are entering Decode, check if any SYSCALL is currently in Execute, Memory, or Writeback */
+    if ((execute_op && execute_op->opcode == OP_SPECIAL && execute_op->subop == SUBOP_SYSCALL) ||
+        (mem_op && mem_op->opcode == OP_SPECIAL && mem_op->subop == SUBOP_SYSCALL) ||
+        (wb_op && wb_op->opcode == OP_SPECIAL && wb_op->subop == SUBOP_SYSCALL)) {
+        return; // Stall
+    }
+
+    /* 2. If the current instruction is a SYSCALL, check if Execute, Memory, or Writeback are occupied */
+    if (decode_op->instruction == 0x0000000C) { 
+        // Decoding opcode/func to confirm SYSCALL
+        uint32_t opc = (decode_op->instruction >> 26) & 0x3F;
+        uint32_t fun = decode_op->instruction & 0x3F;
+        if (opc == OP_SPECIAL && fun == SUBOP_SYSCALL) {
+             // If pipeline is not empty downstream, STALL.
+             if (execute_op || mem_op || wb_op) {
+                 return; 
+             }
+        }
+    }
 
     /* grab op and remove from stage input */
     Pipe_Op *op = decode_op.get();

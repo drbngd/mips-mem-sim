@@ -1,6 +1,7 @@
 #include "cache.h"
 #include "config.h"
 #include "core.h" // Needed for Core def
+#include "processor.h"
 #include <cstring>
 #include <cmath>
 
@@ -104,19 +105,23 @@ bool Cache::probe_write(uint32_t addr, const uint8_t* data) {
     return false;
 }
 
-void Cache::evict(uint32_t set_idx, int way, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data) {
+void Cache::evict(uint32_t set_idx, int way, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data, bool writeback_clean) {
     CacheBlock& block = sets[set_idx].blocks[way];
     
-    if (block.state != INVALID && block.dirty) {
-        if (dirty_evicted) *dirty_evicted = true;
+    if (block.state != INVALID) {
+        bool needs_writeback = block.dirty || writeback_clean;
+        
+        if (dirty_evicted) *dirty_evicted = block.dirty; // Report actual dirty status
         
         // Reconstruct address: (Tag << tag_shift) | (Set << index_shift)
         // Note: Offset is 0 for block address
-        if (evicted_addr) {
-            *evicted_addr = (block.tag << tag_shift) | (set_idx << index_shift);
-        }
-        if (evicted_data) {
-            *evicted_data = block.data; // Copy data
+        if (needs_writeback) {
+             if (evicted_addr) {
+                *evicted_addr = (block.tag << tag_shift) | (set_idx << index_shift);
+            }
+            if (evicted_data) {
+                *evicted_data = block.data; // Copy data
+            }
         }
     } else {
         if (dirty_evicted) *dirty_evicted = false;
@@ -127,14 +132,23 @@ void Cache::evict(uint32_t set_idx, int way, bool* dirty_evicted, uint32_t* evic
     block.dirty = false;
 }
 
-CacheBlock* Cache::install(uint32_t addr, const uint8_t* data, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data) {
+CacheBlock* Cache::install(uint32_t addr, const uint8_t* data, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data, bool writeback_clean) {
     uint32_t set_idx = get_index(addr);
     uint32_t tag = get_tag(addr);
     
-    int way = find_victim(set_idx);
+    // Check if block already exists (e.g. Upgrade from Shared)
+    int way = find_block(set_idx, tag);
     
-    // Handle Eviction
-    evict(set_idx, way, dirty_evicted, evicted_addr, evicted_data);
+    if (way != -1) {
+        // Found existing block, update it in place.
+        // No eviction needed.
+        if (dirty_evicted) *dirty_evicted = false;
+    } else {
+        // Not found, need to allocate new way
+        way = find_victim(set_idx);
+        // Handle Eviction
+        evict(set_idx, way, dirty_evicted, evicted_addr, evicted_data, writeback_clean);
+    }
     
     // Install new block
     CacheBlock& block = sets[set_idx].blocks[way];
@@ -204,9 +218,37 @@ int L2Cache::access(uint32_t addr, bool is_write, int core_id) {
 
     // 2. Check Cache Hit
     if (is_write) {
-        if (probe_write(addr, nullptr)) return L2_HIT; // Hit
+        if (probe_write(addr, nullptr)) {
+            // In INCLUSIVE policy: L2 Hit is normal.
+            
+            // In EXCLUSIVE policy: L2 Hit means block is moving to L1.
+            // We must invalidate the L2 copy.
+            if (incl_policy == INCL_EXCLUSIVE) {
+                uint32_t set_idx = get_index(addr);
+                uint32_t tag = get_tag(addr);
+                int way = find_block(set_idx, tag);
+                if (way != -1) {
+                   sets[set_idx].blocks[way].state = INVALID;
+                   sets[set_idx].blocks[way].dirty = false;
+                }
+            }
+            return L2_HIT; // Hit
+        }
     } else {
-        if (probe_read(addr) != nullptr) return L2_HIT; // Hit
+        if (probe_read(addr) != nullptr) {
+            // EXCLUSIVE Policy: On L2 Hit, invalidate block (move to L1)
+            // Note: probe_read updated LRU. Invalidate effectively removes it.
+            if (incl_policy == INCL_EXCLUSIVE) {
+                uint32_t set_idx = get_index(addr);
+                uint32_t tag = get_tag(addr);
+                int way = find_block(set_idx, tag);
+                if (way != -1) {
+                   sets[set_idx].blocks[way].state = INVALID;
+                   sets[set_idx].blocks[way].dirty = false;
+                }
+            }
+            return L2_HIT; // Hit
+        }
     }
 
     // 3. Miss: Check MSHRs (Merge)
@@ -291,8 +333,14 @@ void L2Cache::complete_mshr(uint32_t addr, std::vector<std::unique_ptr<class Cor
             // Use stored core_id
             int cid = mshrs[i].core_id;
             if (cid >= 0 && cid < cores.size()) {
-                cores[cid]->icache.fill(addr);
-                cores[cid]->dcache.fill(addr);
+                // Determine L1 state based on request type
+                // If it was a write, we grant MODIFIED.
+                // If read, we grant EXCLUSIVE (assuming we are the only one, or SHARED if others have it - but that logic belongs in Coherence step). 
+                // However, L2 Fill usually means we fetched from DRAM, so it's fresh.
+                MESI_State st = mshrs[i].is_write ? MODIFIED : EXCLUSIVE;
+                
+                cores[cid]->icache.fill(addr, st);
+                cores[cid]->dcache.fill(addr, st);
             }
         }
     }
@@ -312,88 +360,321 @@ void L2Cache::handle_l1_writeback(uint32_t addr, const std::vector<uint8_t>& dat
 }
 
 
+// Helper to get back pointers
+void L2Cache::evict(uint32_t set_idx, int way, bool* dirty_evicted, uint32_t* evicted_addr, std::vector<uint8_t>* evicted_data, bool writeback_clean) {
+    // 1. Get address of victim block
+    uint32_t old_tag = sets[set_idx].blocks[way].tag;
+    uint32_t old_addr = (old_tag << tag_shift) | (set_idx << index_shift);
+    bool is_valid = sets[set_idx].blocks[way].state != INVALID;
+
+    // 2. Call base eviction (handles data extraction and invalidation)
+    Cache::evict(set_idx, way, dirty_evicted, evicted_addr, evicted_data, writeback_clean);
+
+    // 3. Inclusive Policy: Invalidate in all L1s logic
+    // If the policy is Inclusive, an eviction from L2 forces invalidation in all L1s (Back-invalidation).
+    // If any L1 has a dirty copy, it must be written back to Memory to preserve data consistency.
+    if (incl_policy == INCL_INCLUSIVE && is_valid) {
+        for (auto* l1 : l1_refs) {
+            // First check if L1 has it and if it's dirty
+            bool is_modified = false;
+            std::vector<uint8_t> data;
+            // Hack: Reuse probe_coherence to get data, then invalidate? 
+            // Or just allow invalidate to return data. 
+            // Let's use probe_coherence (which we implemented).
+            bool present = l1->probe_coherence(old_addr, true, &is_modified, &data); 
+            // true arg means "is_write_req" -> will invalidate L1 block. Perfect.
+            
+            if (present && is_modified) {
+                // We back-invalidated a dirty block from L1. 
+                // Since L2 is evicting, we must write this data to Memory.
+                if (dram_ref) {
+                     dram_ref->enqueue(true, old_addr, -1, DRAM_Req::SRC_MEMORY, stat_cycles);
+                }
+            }
+        }
+    }
+}
+
 /* L1 Cache Methods */
 
-L1Cache::L1Cache(int core_id, L2Cache* l2, uint32_t s, uint32_t w) 
-    : Cache(s, w, BLOCK_SIZE), id(core_id), l2_ref(l2), pending_miss(false), pending_miss_addr(0), pending_miss_ready_cycle(0)
+bool L1Cache::invalidate(uint32_t addr) {
+    uint32_t set_idx = get_index(addr);
+    uint32_t tag = get_tag(addr);
+    int way = find_block(set_idx, tag);
+    
+    if (way != -1) {
+        sets[set_idx].blocks[way].state = INVALID;
+        sets[set_idx].blocks[way].dirty = false;
+        return true;
+    }
+    return false;
+}
+
+// Helper to get block index
+// (No change)
+
+L1Cache::L1Cache(int core_id, L2Cache* l2, class Core* core, uint32_t s, uint32_t w) 
+    : Cache(s, w, BLOCK_SIZE), id(core_id), l2_ref(l2), parent_core(core)
 {
-    // Parent constructor handles initialization
+    // Initialize MSHR
+    mshr.valid = false;
+    mshr.address = 0;
+    mshr.ready_cycle = 0;
+    mshr.core_id = id;
+    
+    // Register self with L2
+    if (l2_ref) {
+        l2_ref->l1_refs.push_back(this);
+    }
+}
+
+
+bool L1Cache::probe_coherence(uint32_t addr, bool is_write_req, bool* is_modified, std::vector<uint8_t>* data) {
+    uint32_t set_idx = get_index(addr);
+    uint32_t tag = get_tag(addr);
+    int way = find_block(set_idx, tag);
+    
+    if (way != -1) {
+        CacheBlock& blk = sets[set_idx].blocks[way];
+        if (blk.state == INVALID) return false;
+
+        bool was_modified = (blk.state == MODIFIED);
+        if (is_modified) *is_modified = was_modified;
+        
+        // If dirty, provide data
+        if (was_modified && data) {
+            *data = blk.data;
+        }
+
+        // State Transitions based on Snoop
+        if (is_write_req) {
+            // Another core is writing -> Invalidate our copy
+            blk.state = INVALID;
+            blk.dirty = false;
+        } else {
+            // Another core is reading -> Downgrade to Shared
+            // If we were Modified or Exclusive, we become Shared.
+            if (blk.state == MODIFIED || blk.state == EXCLUSIVE) {
+                blk.state = SHARED;
+                // If the block was Modified, we technically clean it w.r.t the system here,
+                // because the probe logic (caller) handles the writeback to memory immediately.
+                // Thus, this cache line is now Shared and Clean.
+                blk.dirty = false; 
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 bool L1Cache::access(uint32_t addr, bool is_write, bool is_data_cache) {
+    // 1. Check MSHR (Pending Miss)
+    if (mshr.valid) {
+        // If we are waiting for this address, check if it's ready
+        uint32_t block_addr = addr & ~(block_size - 1);
+        if (mshr.address == block_addr) {
+            if (stat_cycles >= mshr.ready_cycle) {
+                // Determine target state from MSHR context (saved or inferred)
+                // For now, assume we fill nicely.
+                // Actually fill() is called by L2 response or Snoop response.
+                // If ready_cycle is set, it means we hit somewhere and are waiting for latency.
 #ifdef DEBUG
-    printf("[L1 Core %d] Access Addr=%08x write=%d pending=%d\n", id, addr, is_write, pending_miss);
+                printf("[L1 Core %d] Access %08x: MSHR Ready at %lu (Curr %u). Completing.\n", id, addr, mshr.ready_cycle, stat_cycles);
 #endif
-    // 1. Check for Pending Miss
-    // 1. Check for Pending Miss
-    if (pending_miss) {
-        // Check if latency is satisfied
-        if (stat_cycles >= pending_miss_ready_cycle) {
-             fill(pending_miss_addr); // Clears pending_miss
-             // Fall through to probe (which will now HIT)
+                // NOTE: If we satisfied the miss via Snoop or L2 Hit, the data isn't "pushed" to us via callback nicely in this framework without events.
+                // So we simulate the "fill" happening here if it wasn't triggered by L2 callback.
+                
+                // Fill logic:
+                // We use the 'target_state' determined during the Miss phase (Snoop or L2 Response).
+                // This ensures we enter the correct state (Shared, Exclusive, or Modified).
+                MESI_State target = (MESI_State)mshr.target_state;
+                
+                // Perform the installation of the block into L1
+                fill(mshr.address, target);
+                return true; // Hit now (Access satisfied)
+            } else {
+                return false; // Stall
+            }
         } else {
-#ifdef DEBUG
-            printf("[L1 Core %d] STALL: Pending miss for %08x (Req: %08x) ReadyAt: %u Curr: %u\n", id, pending_miss_addr, addr, pending_miss_ready_cycle, stat_cycles);
-#endif
-            return false;
+            return false; // Stall, MSHR busy
         }
     }
 
     // 2. Check Hit
+    CacheBlock* block = nullptr;
     if (is_write) {
-        if (probe_write(addr, nullptr)) return true;
-    } else {
-        if (probe_read(addr) != nullptr) return true;
-    }
-    
-    // 3. Handle Miss
-    // Issue to L2 (Pass core_id)
-    int l2_status = l2_ref->access(addr, is_write, id);
-    
-    if (l2_status == L2_HIT) {
-        // L2 Hit! 
-        pending_miss = true;
-        pending_miss_addr = addr;
-        pending_miss_ready_cycle = stat_cycles + L2_HIT_LATENCY;
+        // Warning: This probe_write updates LRU and Dirty bit.
+        // We only want to do that if it's a real hit (M or E).
+        // If S, it's an UPGRADE MISS.
+        // So we need to peek first.
+        uint32_t set_idx = get_index(addr);
+        uint32_t tag = get_tag(addr);
+        int way = find_block(set_idx, tag);
         
-        return false; // Stall this cycle and wait for latency
-    }
-    else if (l2_status == L2_MISS) {
-#ifdef DEBUG
-        printf("[L1 Core %d] MISS: L2 Accepted %08x. Entering Pending.\n", id, addr);
-#endif
-        pending_miss = true;
-        pending_miss_addr = addr;
-        return false; // Stall pipeline
+        if (way != -1) {
+            block = &sets[set_idx].blocks[way];
+            if (block->state == MODIFIED || block->state == EXCLUSIVE) {
+                // Hit!
+                update_lru(set_idx, way);
+                block->state = MODIFIED;
+                block->dirty = true;
+                return true;
+            } else if (block->state == SHARED) {
+                // Upgrade Miss! Fall through to Step 1.
+            }
+        }
     } else {
-#ifdef DEBUG
-        printf("[L1 Core %d] MISS: L2 REJECTED %08x. Retry.\n", id, addr);
-#endif
-        // L2 busy (MSHRs full). Retry next cycle.
-        return false;
+        // Read
+        block = probe_read(addr); // Handles LRU update if hit
+        if (block) return true;
     }
+    
+    // --- MISS HANDLING START ---
+    
+    // Step 1: Write Exclusion
+    // Check if any *pending* write to this block exists in other MSHRs.
+    // Also if this is a write, check if *any* pending read exists.
+    bool conflict = false;
+    for (const auto& core_ptr : parent_core->proc->cores) {
+        if (core_ptr->id == id) continue; // Skip self
+        
+        // Check I-Cache
+        if (core_ptr->icache.mshr.valid && core_ptr->icache.mshr.address == (addr & ~31)) {
+             if (core_ptr->icache.mshr.is_write || is_write) conflict = true;
+        }
+        // Check D-Cache
+        if (core_ptr->dcache.mshr.valid && core_ptr->dcache.mshr.address == (addr & ~31)) {
+             if (core_ptr->dcache.mshr.is_write || is_write) conflict = true;
+        }
+        if (conflict) break;
+    }
+    
+    if (conflict) return false; // Stall and Retry
+    
+    // Step 2 & 3: L2 MSHR Checks
+    // Check active MSHR in L2 (Step 2)
+    int l2_mshr_idx = l2_ref->check_mshr(addr);
+    if (l2_mshr_idx != -1) return false; // Stall if L2 is already handling this (simplify: no merge for L1 initiated reqs per spec suggestion?)
+    // Spec Step 3: Check availability
+    // We can't easily check "availability" without allocating, but we can check loop.
+    // L2Cache has fixed size MSHR.
+    // If we call access() later it handles it. 
+    // Spec says: "If no L2 MSHRs available, stall."
+    // Let's peek.
+    bool l2_full = true;
+    for(int i=0; i<L2_MSHR_SIZE; i++) { if(!l2_ref->mshrs[i].valid) { l2_full = false; break; } }
+    if (l2_full) return false; // Stall
+    
+    // Step 4: Probe Other L1 Caches
+    bool found_shared = false;
+    bool found_modified = false;
+    std::vector<uint8_t> coherence_data; // To capture modified data
+    
+    for (const auto& core_ptr : parent_core->proc->cores) {
+        if (core_ptr->id == id) continue; // Skip self
+        
+        // Probe I-Cache
+        bool m = false; 
+        if (core_ptr->icache.probe_coherence(addr, is_write, &m, &coherence_data)) {
+            found_shared = true;
+            if (m) found_modified = true;
+        }
+        
+        // Probe D-Cache
+        m = false;
+        if (core_ptr->dcache.probe_coherence(addr, is_write, &m, &coherence_data)) {
+            found_shared = true;
+            if (m) found_modified = true;
+        }
+    }
+
+    // Handle Coherence Results
+    if (found_shared) {
+        // If reading, we found it shared. Our target state is SHARED.
+        // If writing, we invalidated copies. Target is MODIFIED.
+        
+        // Writeback modified data if found
+        if (found_modified) {
+             // "Immediately written into main memory" (Bypassing L2 update)
+             if (l2_ref->dram_ref) {
+                 // Using 'stat_cycles' for timestamp
+                 l2_ref->dram_ref->enqueue(true, addr & ~31, -1, DRAM_Req::SRC_MEMORY, stat_cycles);
+             }
+        }
+        
+        mshr.valid = true;
+        mshr.address = addr & ~31;
+        mshr.is_write = is_write;
+        mshr.ready_cycle = stat_cycles + 5; 
+        
+        // Determine Target State from Snoop
+        if (is_write) {
+            mshr.target_state = MODIFIED;
+        } else {
+            mshr.target_state = SHARED; // We found a copy, so we join as Shared
+        }
+        
+        return false; 
+    }
+    
+    // Step 5: Probe L2
+    if (l2_ref->probe_read(addr)) { // L2 Has it (Hit)
+         int res = l2_ref->access(addr, is_write, id);
+         
+         if (res == L2_HIT) {
+             mshr.valid = true;
+             mshr.address = addr & ~31;
+             mshr.is_write = is_write;
+             mshr.ready_cycle = stat_cycles + 5 + L2_HIT_LATENCY;
+             
+             // L2 Hit State Logic:
+             // If Write -> MODIFIED
+             // If Read -> EXCLUSIVE (Since we passed snooping step without finding it Shared)
+             mshr.target_state = is_write ? MODIFIED : EXCLUSIVE;
+             
+             return false;
+         }
+    }
+    
+    // Step 6: Go to Memory
+    // Allocates MSHR through L2 access logic
+    int res = l2_ref->access(addr, is_write, id);
+    if (res == L2_MISS) {
+         mshr.valid = true;
+         mshr.address = addr & ~31;
+         mshr.is_write = is_write;
+         mshr.ready_cycle = -1; // Wait for callback
+         
+         // DRAM Fill State Logic:
+         // If Write -> MODIFIED
+         // If Read -> EXCLUSIVE (First fetch)
+         mshr.target_state = is_write ? MODIFIED : EXCLUSIVE;
+         
+         return false;
+    }
+
+    return false; // Should not reach here typically unless L2 Busy (checked earlier) or weird state
 }
 
-void L1Cache::fill(uint32_t addr) {
-#ifdef DEBUG
-    printf("[L1 Core %d] FILL: %08x (Pending: %08x)\n", id, addr, pending_miss_addr);
-#endif
-    if (pending_miss && (addr & ~31) == (pending_miss_addr & ~31)) {
-        // Install data (Assuming L2 sent it, though we don't pass data ptr here yet)
+void L1Cache::fill(uint32_t addr, MESI_State target_state) {
+    if (mshr.valid && mshr.address == (addr & ~(block_size - 1))) {
         bool dirty_evicted;
         uint32_t evicted_addr;
         std::vector<uint8_t> evicted_data;
+        bool wb_clean = (l2_ref->incl_policy == INCL_EXCLUSIVE);
         
-        install(pending_miss_addr, nullptr, &dirty_evicted, &evicted_addr, &evicted_data);
-        
-        // Handle Writeback if dirty block was evicted
+        CacheBlock* blk = install(addr, nullptr, &dirty_evicted, &evicted_addr, &evicted_data, wb_clean);
+        if (blk) {
+            blk->state = target_state;
+            if (target_state == MODIFIED) blk->dirty = true;
+        }
+
         if (dirty_evicted) {
+             l2_ref->handle_l1_writeback(evicted_addr, evicted_data);
+        } else if (wb_clean && evicted_data.size() > 0) {
              l2_ref->handle_l1_writeback(evicted_addr, evicted_data);
         }
         
-        pending_miss = false;
-#ifdef DEBUG
-        printf("[L1 Core %d] UNBLOCK: %08x\n", id, addr);
-#endif
+        mshr.valid = false;
     }
 }
