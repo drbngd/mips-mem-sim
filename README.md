@@ -80,3 +80,7 @@ System parameters can be adjusted in `src/config.h`:
 *   `src/processor.cpp`: Top-level orchestration of cores and shared memory.
 *   `src/dram.cpp/h`: Main memory timing model.
 *   `src/mshr.h`: Miss Status Handling Register definition.
+
+## Attribution
+This project is based on the **Computer Architecture** lab assignments by [Professor Onur Mutlu](https://safari.ethz.ch/) at ETH Zurich. Use these materials for educational purposes.
+*   Original Lab Specs: [Computer Architecture - Labs](https://safari.ethz.ch/architecture/fall2025/doku.php?id=labs)
