@@ -10,7 +10,7 @@
 #define _CONFIG_H_
 
 /* System Configuration */
-#define NUM_CORES 4       /* Number of Cores */
+#define NUM_CORES 1       /* Number of Cores */
 #define DRAM_REQ_QUEUE_SIZE 32
 #define DRAM_CHANNEL_WIDTH 8 /* 64-bit channel */
 
